@@ -1,1 +1,8 @@
+streamlit
+pandas
+numpy
+gspread
+gspread-dataframe
+google-auth
+pytz
 
