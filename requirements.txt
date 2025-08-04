@@ -3,9 +3,10 @@ pandas
 numpy
 pytz
 requests
-gspread
-google-oauth2-client
-gspread-dataframe
+python-dateutil
 rapidfuzz
 plotly
 scikit-learn
+gspread
+google-auth
+gspread-dataframe
