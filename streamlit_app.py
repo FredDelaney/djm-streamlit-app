@@ -1,50 +1,51 @@
+# DJM — WORLD-CLASS SCOUTING & TRANSFER PLATFORM (V2)
+# ---------------------------------------------------
+# Tabs:
+# 1) Dashboard
+# 2) Search & Player Profile
+# 3) Club Profile & Compare
+# 4) Roles & Archetypes (unsupervised KMeans)
+# 5) Admin / Data (Excel/CSV ingest, Players upsert, Rebuild ratings)
+# 6) Settings (weights, age curves) — persisted in Google Sheet
+#
+# Data (Google Sheet tabs created on demand):
+# - players            (master data; stores tm_url, tm_id, dob, positions, etc.)
+# - raw_matches        (per-match rows from Excel/CSV)
+# - feature_store      (aggregated per-player features; auto)
+# - ratings            (overall_now, 5yr, uncertainty; auto)
+# - roles              (cluster labels per player; auto)
+# - club_rosters       (tm_id, player_name, club_name, position_group, minutes) — import or maintain
+# - settings           (key/value for weights, curves, mappings)
+# - mappings           (saved ingestion column mappings by filename signature)
+#
+# NOTE: No scraping by default. We only store Transfermarkt IDs/URLs and
+# run a BEST-EFFORT value fetch (can be disabled in Settings).
+# ---------------------------------------------------
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import pytz
-import re, requests, math
+import re, requests, math, json
 from datetime import datetime
 from rapidfuzz import process as fuzz
+from dateutil import parser as dtparser
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
-# -------------------- APP CONFIG & THEME --------------------
-st.set_page_config(
-    page_title="DJM — Scouting & Transfers",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ---------------------------- APP CONFIG ----------------------------
+st.set_page_config(page_title="DJM — Scouting & Transfers", layout="wide", initial_sidebar_state="expanded")
 
-# Minimal modern theming via CSS
-st.markdown("""
-<style>
-/* Global */
-:root { --accent:#2f80ed; --bg:#0b0f1a; --card:#11172a; --muted:#9aa4b2; --good:#00d084; --warn:#f2c94c; --bad:#ff6b6b; }
-body, .stApp { background: linear-gradient(180deg, #0b0f1a 0%, #0d1224 100%); color:#e6eefc; }
-
-/* Headings */
-h1, h2, h3 { letter-spacing:.2px; }
-
-/* Cards */
-.djm-card { background:var(--card); border-radius:16px; padding:18px 18px 14px; box-shadow: 0 10px 24px rgba(0,0,0,.25); border:1px solid rgba(255,255,255,.05); }
-.djm-kpi { display:flex; gap:10px; align-items:baseline }
-.djm-kpi .big { font-size:38px; font-weight:800; }
-.djm-kpi .label { color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:0.4px; }
-
-/* Buttons */
-.stButton>button { border-radius:12px; padding:8px 14px; font-weight:600; }
-
-/* Inputs */
-.stTextInput>div>div>input, .stSelectbox>div>div>select, .stNumberInput>div>div>input, .stFileUploader, .stMultiSelect>div>div { background:#0f1426; border:1px solid rgba(255,255,255,.08); border-radius:10px; }
-
-/* Tables */
-[data-testid="stDataFrame"] { border-radius:12px; overflow:hidden; border:1px solid rgba(255,255,255,.08); }
-</style>
-""", unsafe_allow_html=True)
-
-# -------------------- SETTINGS --------------------
+# ---------------------------- CONSTANTS -----------------------------
 SHEET_NAME = st.secrets.get("sheet_name", "DJM_Input")
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -53,8 +54,24 @@ SCOPES = [
 
 PLAYERS_HEADERS = [
     "player_id","player_name","player_qid","dob","age","citizenships",
-    "height_cm","positions","current_club","shirt_number",
+    "height_cm","positions","position_group","current_club","shirt_number",
     "tm_url","tm_id"
+]
+
+RAW_MATCHES_HEADERS = [
+    "tm_id","player_name","date","competition","opponent","minutes",
+    "shots","xg","xa","key_passes",
+    "progressive_passes","progressive_carries",
+    "dribbles_won","tackles_won","interceptions","aerials_won",
+    "passes","passes_accurate","touches","duels_won","position"
+]
+
+FEATURE_STORE_COLS = [
+    "tm_id","player_name","minutes",
+    "xg_p90","xa_p90","shots_p90","kp_p90",
+    "prog_pass_p90","prog_carry_p90","dribbles_p90",
+    "tackles_p90","inter_p90","aerials_p90",
+    "pass_acc"
 ]
 
 RATINGS_HEADERS = [
@@ -64,18 +81,51 @@ RATINGS_HEADERS = [
     "updated_at"
 ]
 
-RAW_MATCHES_HEADERS = [
-    "tm_id","player_name","date","competition","opponent","minutes",
-    "shots","xg","xa","key_passes","dribbles_won","progressive_passes",
-    "progressive_carries","tackles_won","interceptions","aerials_won","passes",
-    "passes_accurate","duels_won","touches","position"
-]
+DEFAULT_WEIGHTS = {
+    "attack": 0.35,      # xG, xA, shots, key passes
+    "progression": 0.25, # progressive passes/carries, dribbles
+    "defence": 0.20,     # tackles/interceptions/aerials
+    "passing": 0.20      # pass accuracy
+}
+DEFAULT_SETTINGS = {
+    "w_attack": 0.35,
+    "w_progression": 0.25,
+    "w_defence": 0.20,
+    "w_passing": 0.20,
+    "age_curve_u21": 1.10,
+    "age_curve_22_24": 1.05,
+    "age_curve_25_28": 1.00,
+    "age_curve_29_31": 0.97,
+    "age_curve_32_34": 0.94,
+    "age_curve_35p": 0.90,
+    "projection_u22": 1.10,
+    "projection_23_26": 1.04,
+    "projection_30p": 0.98,
+    "minutes_shrink_lt900": 0.70,
+    "minutes_shrink_900_1799": 0.85,
+    "tm_value_fetch": True  # best-effort HTML parse; set False to disable
+}
 
-# -------------------- GOOGLE SHEETS I/O --------------------
+THEME_CSS = """
+<style>
+:root { --accent:#5B8CFF; --bg:#0B1020; --card:#121933; --muted:#9aa4b2; --good:#00E88F; --warn:#F2C94C; --bad:#FF6B6B; }
+.stApp { background: radial-gradient(1200px 800px at 10% 0%, #0B1020 0%, #0A1228 40%, #0B1020 100%); color:#E9F1FF; }
+.djm-row { display:flex; gap:14px; }
+.djm-card { background:var(--card); border-radius:16px; padding:18px; border:1px solid rgba(255,255,255,.06); box-shadow:0 20px 40px rgba(0,0,0,.35); }
+.djm-kpi .big { font-size:40px; font-weight:900; letter-spacing:.2px; }
+.djm-kpi .label { color:var(--muted); text-transform:uppercase; font-size:12px; letter-spacing:.3px; }
+.stButton>button { border-radius:12px; padding:8px 14px; font-weight:600; background:linear-gradient(120deg, #5B8CFF, #6BD6FF); color:#0B1020; border:0; }
+[data-testid="stDataFrame"] { border-radius:12px; overflow:hidden; border:1px solid rgba(255,255,255,.08); }
+.stProgress > div > div { background: linear-gradient(90deg, #5B8CFF, #6BD6FF); }
+</style>
+"""
+
+st.markdown(THEME_CSS, unsafe_allow_html=True)
+
+# ---------------------------- GSHEET I/O -----------------------------
 @st.cache_resource(show_spinner=False)
 def connect_gsheet():
-    creds_info = st.secrets["gcp_service_account"]
-    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
     client = gspread.authorize(creds)
     return client.open(SHEET_NAME)
 
@@ -83,29 +133,12 @@ def get_or_create_ws(ss, name, headers=None):
     try:
         ws = ss.worksheet(name)
     except Exception:
-        ws = ss.add_worksheet(title=name, rows=1000, cols=max(20, len(headers or [])))
+        ws = ss.add_worksheet(title=name, rows=2000, cols=max(30, len(headers or [])))
         if headers:
             ws.update('A1', [headers])
     return ws
 
-def read_tab(ss, tab):
-    try:
-        ws = ss.worksheet(tab)
-    except Exception:
-        return None
-    df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
-    if df is None or df.empty:
-        return None
-    df = df.dropna(how="all").reset_index(drop=True)
-    # numeric coercion for known fields
-    for c in df.columns:
-        if c in {"p_move","p_make_it","contract_months_left","buyer_need_index",
-                 "role_fit","media_rumor_score","scarcity_index","injury_days_pct",
-                 "availability_pct","adj_minutes","role_percentile"}:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-def read_sheet_as_df(ss, name):
+def read_sheet(ss, name) -> pd.DataFrame:
     try:
         ws = ss.worksheet(name)
     except Exception:
@@ -115,21 +148,41 @@ def read_sheet_as_df(ss, name):
         return pd.DataFrame()
     return df.dropna(how="all")
 
-def write_df_to_sheet(ss, name, df):
+def write_sheet(ss, name, df: pd.DataFrame):
     ws = get_or_create_ws(ss, name, headers=list(df.columns))
     ws.clear()
     set_with_dataframe(ws, df, row=1, col=1, include_index=False, include_column_header=True)
 
-# -------------------- UTILS --------------------
-def percent(x):
-    try:
-        return f"{100*float(x):.1f}%"
-    except Exception:
-        return ""
+def now_ts() -> str:
+    tz = pytz.timezone("Europe/Rome")
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
 
+# ---------------------------- SETTINGS PERSISTENCE -------------------
+def load_settings(ss) -> dict:
+    df = read_sheet(ss, "settings")
+    if df.empty: return DEFAULT_SETTINGS.copy()
+    d = DEFAULT_SETTINGS.copy()
+    for _, r in df.iterrows():
+        k = str(r.get("key","")).strip()
+        v = r.get("value", "")
+        if not k: continue
+        try:
+            d[k] = json.loads(v)
+        except Exception:
+            # try numeric
+            try:
+                d[k] = float(v)
+            except Exception:
+                d[k] = v
+    return d
+
+def save_settings(ss, settings: dict):
+    rows = [{"key":k, "value":json.dumps(v)} for k,v in settings.items()]
+    write_sheet(ss, "settings", pd.DataFrame(rows, columns=["key","value"]))
+
+# ---------------------------- UTILS ---------------------------------
 def parse_tm_id(url_or_id: str):
-    if not url_or_id:
-        return None
+    if not url_or_id: return None
     s = str(url_or_id).strip()
     m = re.search(r"/spieler/(\d+)", s)
     if m: return m.group(1)
@@ -138,492 +191,615 @@ def parse_tm_id(url_or_id: str):
     nums = re.findall(r"\d{3,}", s)
     return nums[-1] if nums else None
 
-def fuzzy_pick(options, query, limit=5, score_cutoff=65):
-    if not options: return []
-    res = fuzz.extract(query, options, limit=limit, score_cutoff=score_cutoff)
-    return [r[0] for r in res]
+def position_group_from_text(txt: str) -> str:
+    t = (txt or "").lower()
+    if "gk" in t or "keeper" in t or "goal" in t: return "GK"
+    if any(w in t for w in ["cb","rb","lb","rwb","lwb","def","back"]): return "DF"
+    if any(w in t for w in ["dm","cm","am","mid"]): return "MF"
+    if any(w in t for w in ["fw","st","wing","w","strik","att"]): return "FW"
+    return ""
 
-def now_ts():
-    tz = pytz.timezone("Europe/Rome")
-    return datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
+def percent(x):
+    try:
+        return f"{100*float(x):.1f}%"
+    except Exception:
+        return ""
 
-# -------------------- DATA LAYER: UPSERTS --------------------
+def best_effort_tm_value(tm_url: str, enabled=True) -> str|None:
+    if not enabled or not tm_url: return None
+    try:
+        hdrs = {"User-Agent":"Mozilla/5.0"}
+        r = requests.get(tm_url, headers=hdrs, timeout=8)
+        if r.status_code != 200: return None
+        m = re.search(r"Market value[^€£]*([€£]\s?[\d\.,]+[mk]?)", r.text, re.I)
+        return m.group(1).replace(" ", "") if m else None
+    except Exception:
+        return None
+
+def norm_01_series(s: pd.Series):
+    if s.empty: return s
+    lo, hi = np.nanpercentile(s, 5), np.nanpercentile(s, 95)
+    return (s - lo) / (hi - lo + 1e-9)
+
+# ---------------------------- ADMIN: UPSERTS ------------------------
 def upsert_players(ss, df_in: pd.DataFrame) -> tuple[int,int]:
     _ = get_or_create_ws(ss, "players", headers=PLAYERS_HEADERS)
-    existing = read_sheet_as_df(ss, "players")
-    if existing.empty:
-        existing = pd.DataFrame(columns=PLAYERS_HEADERS)
+    existing = read_sheet(ss, "players")
+    if existing.empty: existing = pd.DataFrame(columns=PLAYERS_HEADERS)
 
     df = df_in.copy()
     for c in PLAYERS_HEADERS:
-        if c not in df.columns:
-            df[c] = pd.NA
+        if c not in df.columns: df[c] = pd.NA
 
-    df["tm_id"] = df.apply(
-        lambda r: r["tm_id"] if pd.notna(r["tm_id"]) and str(r["tm_id"]).strip() != ""
-        else parse_tm_id(str(r.get("tm_url",""))),
-        axis=1
-    )
-    for c in ["player_id","player_name","player_qid","dob","tm_url","tm_id"]:
+    # parse tm_id if missing but tm_url available
+    df["tm_id"] = df.apply(lambda r: r["tm_id"] if pd.notna(r["tm_id"]) and str(r["tm_id"]).strip()!=""
+                           else parse_tm_id(str(r.get("tm_url",""))), axis=1)
+
+    # fallback position_group from positions text
+    for i, r in df.iterrows():
+        if not str(r.get("position_group","")).strip():
+            df.at[i, "position_group"] = position_group_from_text(str(r.get("positions","")))
+
+    # normalize strings
+    for c in ["player_id","player_name","player_qid","dob","tm_url","tm_id","position_group","positions","current_club"]:
         df[c] = df[c].astype(str).str.strip().replace({"None":"","nan":""})
 
     existing = existing.reindex(columns=PLAYERS_HEADERS).fillna("")
     ex_by_tm = {str(t): i for i,t in enumerate(existing["tm_id"].astype(str)) if t}
-    ex_by_name_dob = {(str(n).lower(),str(d)): i
-                      for i,(n,d) in enumerate(zip(existing["player_name"].astype(str),
-                                                   existing["dob"].astype(str))) if n}
+    ex_by_name_dob = {(str(n).lower(), str(d)): i for i,(n,d)
+                      in enumerate(zip(existing["player_name"].astype(str), existing["dob"].astype(str))) if n}
 
-    inserts, updates = [], 0
+    ins, upd = 0,0
     for _, r in df.iterrows():
         tm_id = str(r["tm_id"]) if pd.notna(r["tm_id"]) else ""
         idx = ex_by_tm.get(tm_id) if tm_id else None
         if idx is None:
-            idx = ex_by_name_dob.get((str(r["player_name"]).lower().strip(), str(r["dob"]).strip()))
-        merged = {h: "" for h in PLAYERS_HEADERS}
-        for h in PLAYERS_HEADERS:
-            incoming = r[h] if h in r.index else ""
-            if idx is None:
-                merged[h] = "" if pd.isna(incoming) else str(incoming)
-            else:
-                prev = existing.iat[idx, existing.columns.get_loc(h)] if h in existing.columns else ""
-                merged[h] = str(incoming) if (pd.notna(incoming) and str(incoming)!="") else str(prev)
-        if idx is None: inserts.append(merged)
+            idx = ex_by_name_dob.get((str(r["player_name"]).lower(), str(r["dob"])))
+        if idx is None:
+            # insert
+            row = {h: str(r[h]) if h in r.index and pd.notna(r[h]) else "" for h in PLAYERS_HEADERS}
+            existing = pd.concat([existing, pd.DataFrame([row])], ignore_index=True)
+            ins += 1
         else:
+            # update
             for h in PLAYERS_HEADERS:
-                existing.iat[idx, existing.columns.get_loc(h)] = merged[h]
-            updates += 1
+                val = r[h] if h in r.index else ""
+                if pd.notna(val) and str(val)!="":
+                    existing.iat[idx, existing.columns.get_loc(h)] = str(val)
+            upd += 1
 
-    if inserts:
-        existing = pd.concat([existing, pd.DataFrame(inserts, columns=PLAYERS_HEADERS)], ignore_index=True)
-
-    write_df_to_sheet(ss, "players", existing.reindex(columns=PLAYERS_HEADERS))
-    return (len(inserts), updates)
+    write_sheet(ss, "players", existing.reindex(columns=PLAYERS_HEADERS))
+    return ins, upd
 
 def append_raw_matches(ss, df_rows: pd.DataFrame) -> int:
     ws = get_or_create_ws(ss, "raw_matches", headers=RAW_MATCHES_HEADERS)
-    existing = read_sheet_as_df(ss, "raw_matches")
-    if existing.empty:
-        existing = pd.DataFrame(columns=RAW_MATCHES_HEADERS)
-    # align
-    df_rows = df_rows.reindex(columns=RAW_MATCHES_HEADERS)
-    out = pd.concat([existing, df_rows], ignore_index=True)
-    write_df_to_sheet(ss, "raw_matches", out)
+    existing = read_sheet(ss, "raw_matches")
+    if existing.empty: existing = pd.DataFrame(columns=RAW_MATCHES_HEADERS)
+    out = pd.concat([existing, df_rows.reindex(columns=RAW_MATCHES_HEADERS)], ignore_index=True)
+    write_sheet(ss, "raw_matches", out)
     return len(df_rows)
 
-# -------------------- FEATURE ENGINEERING --------------------
+# ---------------------------- FEATURE STORE -------------------------
 def safe_div(a,b):
     try:
-        if pd.isna(a) or pd.isna(b) or b==0: return np.nan
+        if pd.isna(a) or pd.isna(b) or float(b)==0: return np.nan
         return float(a)/float(b)
     except Exception:
         return np.nan
 
-def build_feature_store(ss) -> pd.DataFrame:
-    """Aggregate raw_matches to per-player seasonal features."""
-    raw = read_sheet_as_df(ss, "raw_matches")
+def rebuild_feature_store(ss):
+    raw = read_sheet(ss, "raw_matches")
     if raw.empty:
-        return pd.DataFrame(columns=["tm_id","player_name","minutes",
-                                     "xg","xa","shots","key_passes","prog_passes",
-                                     "prog_carries","tackles","interceptions",
-                                     "dribbles_won","aerials_won","passes","passes_acc"])
-    # coerce
-    num_cols = ["minutes","xg","xa","shots","key_passes","progressive_passes",
-                "progressive_carries","tackles_won","interceptions","dribbles_won",
-                "aerials_won","passes","passes_accurate","duels_won","touches"]
+        write_sheet(ss, "feature_store", pd.DataFrame(columns=FEATURE_STORE_COLS))
+        return
+
+    # typed columns
+    num_cols = ["minutes","xg","xa","shots","key_passes","progressive_passes","progressive_carries",
+                "dribbles_won","tackles_won","interceptions","aerials_won","passes","passes_accurate",
+                "touches","duels_won"]
     for c in num_cols:
-        if c in raw.columns:
-            raw[c] = pd.to_numeric(raw[c], errors="coerce")
+        if c in raw.columns: raw[c] = pd.to_numeric(raw[c], errors="coerce")
 
     g = raw.groupby(["tm_id","player_name"], dropna=False).agg({
         "minutes":"sum",
         "xg":"sum","xa":"sum","shots":"sum","key_passes":"sum",
         "progressive_passes":"sum","progressive_carries":"sum",
-        "tackles_won":"sum","interceptions":"sum","dribbles_won":"sum",
-        "aerials_won":"sum","passes":"sum","passes_accurate":"sum"
+        "dribbles_won":"sum","tackles_won":"sum","interceptions":"sum","aerials_won":"sum",
+        "passes":"sum","passes_accurate":"sum"
     }).reset_index()
 
-    # per90s
     mins = g["minutes"].replace({0:np.nan})
     feats = pd.DataFrame({
-        "tm_id": g["tm_id"], "player_name": g["player_name"],
-        "minutes": g["minutes"],
-        "xg_p90": g["xg"]/mins*90, "xa_p90": g["xa"]/mins*90, "shots_p90": g["shots"]/mins*90,
-        "kp_p90": g["key_passes"]/mins*90,
-        "prog_pass_p90": g["progressive_passes"]/mins*90,
-        "prog_carry_p90": g["progressive_carries"]/mins*90,
-        "tackles_p90": g["tackles_won"]/mins*90, "inter_p90": g["interceptions"]/mins*90,
-        "dribbles_p90": g["dribbles_won"]/mins*90, "aerials_p90": g["aerials_won"]/mins*90,
-        "pass_acc": safe_div(g["passes_accurate"], g["passes"])
+        "tm_id": g["tm_id"], "player_name": g["player_name"], "minutes": g["minutes"],
+        "xg_p90": g["xg"]/mins*90, "xa_p90": g["xa"]/mins*90, "shots_p90": g["shots"]/mins*90, "kp_p90": g["key_passes"]/mins*90,
+        "prog_pass_p90": g["progressive_passes"]/mins*90, "prog_carry_p90": g["progressive_carries"]/mins*90,
+        "dribbles_p90": g["dribbles_won"]/mins*90, "tackles_p90": g["tackles_won"]/mins*90,
+        "inter_p90": g["interceptions"]/mins*90, "aerials_p90": g["aerials_won"]/mins*90,
+        "pass_acc": g.apply(lambda r: safe_div(r["passes_accurate"], r["passes"]), axis=1)
     })
-    return feats
 
-# -------------------- SIMPLE, EXPLAINABLE RATING --------------------
-DEFAULT_WEIGHTS = {
-    "attack": 0.35,      # xG, xA, shots, key passes
-    "progression": 0.25, # progressive passes/carries, dribbles
-    "defence": 0.20,     # tackles/interceptions/aerials
-    "passing": 0.20      # pass accuracy
-}
+    write_sheet(ss, "feature_store", feats.reindex(columns=FEATURE_STORE_COLS))
 
-def _norm01(s):
-    if s.empty: return s
-    lo, hi = np.nanpercentile(s, 5), np.nanpercentile(s, 95)
-    return (s - lo) / (hi - lo + 1e-9)
+# ---------------------------- RATINGS ENGINE ------------------------
+def age_multiplier(age, s):
+    if pd.isna(age): return 1.0
+    a = float(age)
+    if a <= 21: return s["age_curve_u21"]
+    if a <= 24: return s["age_curve_22_24"]
+    if a <= 28: return s["age_curve_25_28"]
+    if a <= 31: return s["age_curve_29_31"]
+    if a <= 34: return s["age_curve_32_34"]
+    return s["age_curve_35p"]
 
-def compute_ratings_from_features(feats: pd.DataFrame, age_lookup: pd.DataFrame|None=None):
-    """Return ratings dataframe with overall_now & overall_5yr."""
-    if feats.empty: return pd.DataFrame(columns=RATINGS_HEADERS)
+def projection_growth(age, s):
+    if pd.isna(age): return 1.03
+    a = float(age)
+    if a <= 22: return s["projection_u22"]
+    if a <= 26: return s["projection_23_26"]
+    if a >= 30: return s["projection_30p"]
+    return 1.00
 
-    # Normalize each block
-    att = _norm01(0.6*feats["xg_p90"].fillna(0) + 0.4*feats["xa_p90"].fillna(0) + 0.2*feats["shots_p90"].fillna(0) + 0.4*feats["kp_p90"].fillna(0))
-    prog = _norm01(0.6*feats["prog_pass_p90"].fillna(0) + 0.4*feats["prog_carry_p90"].fillna(0) + 0.2*feats["dribbles_p90"].fillna(0))
-    dfn = _norm01(0.6*feats["tackles_p90"].fillna(0) + 0.6*feats["inter_p90"].fillna(0) + 0.2*feats["aerials_p90"].fillna(0))
-    pas = _norm01(feats["pass_acc"].fillna(0))
+def minutes_shrink(minutes, s):
+    m = 0 if pd.isna(minutes) else float(minutes)
+    if m < 900: return s["minutes_shrink_lt900"]
+    if m < 1800: return s["minutes_shrink_900_1799"]
+    return 1.00
 
-    overall01 = (
-        DEFAULT_WEIGHTS["attack"]*att.fillna(0) +
-        DEFAULT_WEIGHTS["progression"]*prog.fillna(0) +
-        DEFAULT_WEIGHTS["defence"]*dfn.fillna(0) +
-        DEFAULT_WEIGHTS["passing"]*pas.fillna(0)
-    )
+def rebuild_ratings(ss, settings: dict):
+    feats = read_sheet(ss, "feature_store")
+    players = read_sheet(ss, "players")
+    if feats.empty:
+        write_sheet(ss, "ratings", pd.DataFrame(columns=RATINGS_HEADERS)); return
 
-    # crude age curve (if we have age)
-    if age_lookup is not None and not age_lookup.empty and "age" in age_lookup.columns:
-        ages = feats.merge(age_lookup[["tm_id","age"]], on="tm_id", how="left")["age"]
-        def age_mult(a):
-            if pd.isna(a): return 1.0
-            a=float(a)
-            if a<=21: return 1.10
-            if a<=24: return 1.05
-            if a<=28: return 1.00
-            if a<=31: return 0.97
-            if a<=34: return 0.94
-            return 0.90
-        mult = ages.map(age_mult)
-    else:
-        mult = 1.0
+    # normalize blocks
+    att = norm_01_series(0.6*feats["xg_p90"].fillna(0) + 0.4*feats["xa_p90"].fillna(0) + 0.2*feats["shots_p90"].fillna(0) + 0.4*feats["kp_p90"].fillna(0))
+    prog = norm_01_series(0.6*feats["prog_pass_p90"].fillna(0) + 0.4*feats["prog_carry_p90"].fillna(0) + 0.2*feats["dribbles_p90"].fillna(0))
+    dfn = norm_01_series(0.6*feats["tackles_p90"].fillna(0) + 0.6*feats["inter_p90"].fillna(0) + 0.2*feats["aerials_p90"].fillna(0))
+    pas = norm_01_series(feats["pass_acc"].fillna(0))
 
-    overall_now = (overall01.clip(0,1) * mult).clip(0,1) * 100.0
-    # 5-year projection: young up, old down; shrink to mean if low mins
-    minutes = feats["minutes"].fillna(0)
-    min_mult = minutes.apply(lambda m: 0.7 if m < 900 else (0.85 if m<1800 else 1.0))
-    growth = ages.map(lambda a: 1.10 if (pd.notna(a) and a<=22) else (1.04 if pd.notna(a) and a<=26 else (0.98 if pd.notna(a) and a>=30 else 1.00))) if ('ages' in locals()) else 1.03
-    overall_5 = (overall_now/100.0 * growth * min_mult).clip(0,1) * 100.0
+    wA, wP, wD, wPa = settings["w_attack"], settings["w_progression"], settings["w_defence"], settings["w_passing"]
+    base01 = (wA*att.fillna(0) + wP*prog.fillna(0) + wD*dfn.fillna(0) + wPa*pas.fillna(0)).clip(0,1)
+
+    # join age & position_group
+    lookup = players[["tm_id","age","position_group"]].copy() if not players.empty else pd.DataFrame(columns=["tm_id","age","position_group"])
+    df = feats[["tm_id","player_name","minutes"]].copy()
+    df = df.join(base01.rename("base01"))
+    df = df.merge(lookup, on="tm_id", how="left")
+
+    # apply multipliers
+    df["now"] = (df["base01"] * df["age"].map(lambda a: age_multiplier(a, settings)).fillna(1.0)).clip(0,1)*100.0
+    df["proj5"] = (df["now"]/100.0 * df["age"].map(lambda a: projection_growth(a, settings)).fillna(1.03) * df["minutes"].map(lambda m: minutes_shrink(m, settings))).clip(0,1)*100.0
 
     out = pd.DataFrame({
-        "tm_id": feats["tm_id"],
-        "player_name": feats["player_name"],
-        "position_group": "",  # filled if you store it
-        "age": age_lookup.set_index("tm_id").reindex(feats["tm_id"])["age"].values if (age_lookup is not None and not age_lookup.empty and "tm_id" in age_lookup.columns) else np.nan,
-        "overall_now": overall_now.round(1),
-        "overall_5yr": overall_5.round(1),
-        "uncert_low": (overall_now * 0.90).round(1),
-        "uncert_high": (overall_now * 1.10).clip(0,100).round(1),
-        "minutes_90": feats["minutes"].fillna(0).astype(float).round(0),
-        "availability": np.nan,  # can join later from injuries
-        "role_fit": np.nan,      # join later from role clustering
-        "market_signal": np.nan, # join later from transfer tab
+        "tm_id": df["tm_id"],
+        "player_name": df["player_name"],
+        "position_group": df["position_group"].fillna(""),
+        "age": df["age"],
+        "overall_now": df["now"].round(1),
+        "overall_5yr": df["proj5"].round(1),
+        "uncert_low": (df["now"]*0.90).round(1),
+        "uncert_high": (df["now"]*1.10).clip(0,100).round(1),
+        "minutes_90": df["minutes"].fillna(0).round(0),
+        "availability": np.nan,
+        "role_fit": np.nan,
+        "market_signal": np.nan,
         "updated_at": now_ts()
     })
-    return out
+    write_sheet(ss, "ratings", out.reindex(columns=RATINGS_HEADERS))
 
-# -------------------- OPTIONAL: TM value (best-effort) --------------------
-def fetch_tm_value_eur(tm_url: str) -> str|None:
-    """Best-effort: parse TM market value text from the page. If blocked, return None."""
-    try:
-        if not tm_url: return None
-        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        r = requests.get(tm_url, headers=hdrs, timeout=10)
-        if r.status_code != 200: return None
-        html = r.text
-        # Very loose regex for "Market value" blocks like "€60.00m"
-        m = re.search(r"Market value[^€]*([€£]\s?[\d\.,]+[mk]?)", html, flags=re.IGNORECASE)
-        if m: return m.group(1).replace(" ", "")
-        return None
-    except Exception:
-        return None
+# ---------------------------- ROLES / ARCHETYPES --------------------
+ROLE_FEATURES = ["xg_p90","xa_p90","shots_p90","kp_p90","prog_pass_p90","prog_carry_p90","dribbles_p90","tackles_p90","inter_p90","aerials_p90","pass_acc"]
 
-# -------------------- SIDEBAR --------------------
+ROLE_LABELS = {
+    "FW": ["Channel 9","Target 9","Wide Inside Fwd","Winger","Second Striker"],
+    "MF": ["Box-to-Box 8","Deep Playmaker 6","Ball-Winning 6/8","Advanced 8/10","Progressor 8"],
+    "DF": ["Ball-Playing CB","Stopper CB","Inverted FB","Overlapping FB","Wing-Back"],
+    "GK": ["Sweeper GK","Shot-Stopper GK"]
+}
+
+def rebuild_roles(ss, n_clusters_per_group=4):
+    feats = read_sheet(ss, "feature_store")
+    players = read_sheet(ss, "players")
+    if feats.empty or players.empty:
+        write_sheet(ss, "roles", pd.DataFrame(columns=["tm_id","player_name","position_group","role_cluster","role_label","pca_x","pca_y"])); return
+
+    # attach position group
+    df = feats.merge(players[["tm_id","position_group"]], on="tm_id", how="left")
+    out_rows = []
+    for pg in ["FW","MF","DF","GK"]:
+        sub = df[df["position_group"]==pg].copy()
+        if sub.empty: continue
+        X = sub[ROLE_FEATURES].fillna(0.0).values
+        X = StandardScaler().fit_transform(X)
+        k = min(n_clusters_per_group, max(1, len(sub)//8))
+        kmeans = KMeans(n_clusters=k, n_init="auto", random_state=42).fit(X)
+        pca = PCA(n_components=2, random_state=42).fit_transform(X)
+        labels = kmeans.labels_
+        # map to human label set cyclically
+        label_set = ROLE_LABELS.get(pg, [f"{pg} Role {i}" for i in range(k)])
+        human = [label_set[i % len(label_set)] for i in labels]
+        tmp = pd.DataFrame({
+            "tm_id": sub["tm_id"],
+            "player_name": sub["player_name"],
+            "position_group": pg,
+            "role_cluster": labels,
+            "role_label": human,
+            "pca_x": pca[:,0],
+            "pca_y": pca[:,1]
+        })
+        out_rows.append(tmp)
+    if out_rows:
+        roles = pd.concat(out_rows, ignore_index=True)
+    else:
+        roles = pd.DataFrame(columns=["tm_id","player_name","position_group","role_cluster","role_label","pca_x","pca_y"])
+    write_sheet(ss, "roles", roles)
+
+# ---------------------------- UI HELPERS ----------------------------
+def kpi_card(label, value, color="var(--accent)"):
+    st.markdown(f"""
+    <div class="djm-card djm-kpi">
+      <div class="big" style="color:{color}">{value}</div>
+      <div class="label">{label}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+def gauge(value, title):
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=float(value),
+        number={'suffix': "", 'font': {'size': 30}},
+        gauge={'axis': {'range': [0, 100]},
+               'bar': {'color': '#5B8CFF'},
+               'bgcolor': "#0B1020",
+               'borderwidth': 1,
+               'bordercolor': "rgba(255,255,255,.15)"}},
+        domain={'x': [0, 1], 'y': [0, 1]}
+    ))
+    fig.update_layout(height=220, margin=dict(l=10,r=10,t=30,b=10), paper_bgcolor="rgba(0,0,0,0)")
+    fig.update_layout(title=title)
+    st.plotly_chart(fig, use_container_width=True, theme=None)
+
+def radar(dict_scores: dict, title: str):
+    labels = list(dict_scores.keys())
+    vals = list(dict_scores.values())
+    labels.append(labels[0]); vals.append(vals[0])
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(r=vals, theta=labels, fill='toself', name='Score', line=dict(width=2)))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=False,
+                      height=360, margin=dict(l=10,r=10,t=30,b=10), paper_bgcolor="rgba(0,0,0,0)", title=title)
+    st.plotly_chart(fig, use_container_width=True, theme=None)
+
+def fuzzy_pick(options, query, limit=8, score_cutoff=65):
+    if not options: return []
+    res = fuzz.extract(query, options, limit=limit, score_cutoff=score_cutoff)
+    return [r[0] for r in res]
+
+# ---------------------------- SIDEBAR -------------------------------
 with st.sidebar:
     st.header("Data source")
     try:
         ss = connect_gsheet()
         st.success("Connected ✅")
     except Exception:
-        st.error("Could not connect to Google Sheet. Check secrets & sharing.")
+        st.error("Cannot open Google Sheet. Check secrets & sharing.")
         st.stop()
-    st.write("Sheet:", f"**{SHEET_NAME}**")
-    st.write("As of:", now_ts())
-    refresh = st.button("🔄 Refresh", key="refresh_btn")
+    st.caption(f"Sheet: **{SHEET_NAME}** · {now_ts()}")
+    refresh = st.button("🔄 Refresh", use_container_width=True)
 
-# -------------------- LOAD DATA --------------------
-scores_transfers = read_tab(ss, "scores_transfers")
-scores_youth     = read_tab(ss, "scores_youth")
-players_df       = read_sheet_as_df(ss, "players")
-raw_matches      = read_sheet_as_df(ss, "raw_matches")
+# ---------------------------- LOAD DATA -----------------------------
+players      = read_sheet(ss, "players")
+raw_matches  = read_sheet(ss, "raw_matches")
+feats        = read_sheet(ss, "feature_store")
+ratings      = read_sheet(ss, "ratings")
+roles        = read_sheet(ss, "roles")
+settings     = load_settings(ss)
 
 if refresh:
-    scores_transfers = read_tab(ss, "scores_transfers")
-    scores_youth     = read_tab(ss, "scores_youth")
-    players_df       = read_sheet_as_df(ss, "players")
-    raw_matches      = read_sheet_as_df(ss, "raw_matches")
+    players = read_sheet(ss, "players")
+    raw_matches = read_sheet(ss, "raw_matches")
+    feats = read_sheet(ss, "feature_store")
+    ratings = read_sheet(ss, "ratings")
+    roles = read_sheet(ss, "roles")
+    settings = load_settings(ss)
 
-# -------------------- HEADER --------------------
-st.markdown(f"<div class='djm-card'><div class='djm-kpi'><div class='big'>DJM Scouting Platform</div><div class='label'>Live</div></div><div style='color:#9aa4b2'>Search, score, compare. Upload Excel/CSV to grow the database.</div></div>", unsafe_allow_html=True)
+# ---------------------------- HEADER --------------------------------
+st.markdown(
+    "<div class='djm-card'><div style='font-size:28px;font-weight:800;'>DJM Scouting & Transfer Intelligence</div>"
+    "<div style='color:#9aa4b2'>Better than Wyscout/SciSports (minus video): search, score, roles, club fit, and deal prep.</div></div>",
+    unsafe_allow_html=True
+)
 st.write("")
 
-# -------------------- TABS --------------------
-tab1, tab2, tab3, tab4 = st.tabs(["Likely Movers", "Youth", "Player Profile", "Admin / Data"])
+# ---------------------------- TABS ----------------------------------
+tab_dash, tab_profile, tab_club, tab_roles, tab_admin, tab_settings = st.tabs(
+    ["Dashboard", "Search / Player Profile", "Club Profile & Compare", "Roles & Archetypes", "Admin / Data", "Settings"]
+)
 
-# ---------- TAB 1: TRANSFERS ----------
-with tab1:
-    st.subheader("Likely Movers — ranked probabilities")
-    if scores_transfers is None:
-        st.info("`scores_transfers` tab missing. Generate in Colab (Cell 13).")
+# ---------------------------- TAB: DASHBOARD -------------------------
+with tab_dash:
+    c1, c2, c3, c4 = st.columns(4)
+    kpi_card("Players", f"{len(players) if not players.empty else 0}")
+    kpi_card("Match rows", f"{len(raw_matches) if not raw_matches.empty else 0}")
+    kpi_card("Rated players", f"{len(ratings['tm_id'].unique()) if not ratings.empty else 0}")
+    kpi_card("Last build", settings.get("last_build","—"))
+
+    st.subheader("Ratings snapshot")
+    if ratings.empty:
+        st.info("No ratings yet. Go to **Admin / Data → Rebuild Feature Store and Ratings** after you upload stats.")
     else:
-        df = scores_transfers.copy()
-        c1, c2, c3, c4 = st.columns(4)
-        pos_list = sorted(df["position_group"].dropna().unique()) if "position_group" in df.columns else []
-        pos_sel  = c1.multiselect("Position(s)", pos_list, default=pos_list, key="t_pos")
-        pmin     = c2.slider("Min probability", 0.0, 1.0, 0.50, 0.01, key="t_pmin")
-        search   = c3.text_input("Search name/club", "", key="t_search")
-        sort_desc= c4.checkbox("Sort by probability (desc)", True, key="t_sort")
+        show = ratings.sort_values("overall_now", ascending=False).head(30)
+        st.dataframe(show[["player_name","position_group","age","overall_now","overall_5yr","minutes_90"]], use_container_width=True, hide_index=True)
 
-        filt = pd.Series(True, index=df.index)
-        if pos_list and "position_group" in df.columns:
-            filt &= df["position_group"].isin(pos_sel)
-        if "p_move" in df.columns:
-            filt &= df["p_move"].fillna(0) >= pmin
-        if search:
-            s = search.lower()
-            name_hit = df.get("player_name", pd.Series("", index=df.index)).astype(str).str.lower().str.contains(s, na=False)
-            club_hit = df.get("current_club", pd.Series("", index=df.index)).astype(str).str.lower().str.contains(s, na=False)
-            filt &= (name_hit | club_hit)
+# ---------------------------- TAB: PLAYER PROFILE --------------------
+with tab_profile:
+    st.subheader("Search & Player Profile")
+    all_names = sorted(set(
+        list(players.get("player_name", pd.Series([],dtype=str)).dropna().astype(str)) +
+        list(ratings.get("player_name", pd.Series([],dtype=str)).dropna().astype(str))
+    ))
+    q = st.text_input("Type a player name", "")
+    picks = fuzzy_pick(all_names, q, limit=8) if q else []
+    name = st.selectbox("Pick", options=picks, index=0 if picks else None, placeholder="Select…")
+    tm_input = st.text_input("…or paste Transfermarkt URL/ID", "")
+    tm_id = parse_tm_id(tm_input)
 
-        dfv = df[filt].copy()
-        if sort_desc and "p_move" in dfv.columns:
-            dfv = dfv.sort_values("p_move", ascending=False)
-        elif set(["position_group","p_move"]).issubset(dfv.columns):
-            dfv = dfv.sort_values(["position_group","p_move"], ascending=[True, False])
+    go_btn = st.button("Load profile", type="primary")
+    if go_btn:
+        st.session_state["_pp"] = {"name": name or q, "tm_id": tm_id}
 
-        show = [c for c in ["player_name","position_group","current_club","p_move",
-                            "contract_months_left","buyer_need_index","role_fit",
-                            "media_rumor_score","scarcity_index","injury_days_pct"] if c in dfv.columns]
-        disp = dfv.copy()
-        if "p_move" in disp.columns: disp["p_move"] = disp["p_move"].map(percent)
-        if "injury_days_pct" in disp.columns: disp["injury_days_pct"] = disp["injury_days_pct"].map(percent)
-        for col in ["buyer_need_index","role_fit","media_rumor_score","scarcity_index"]:
-            if col in disp.columns:
-                disp[col] = disp[col].map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
-        st.dataframe(disp[show], use_container_width=True, hide_index=True)
-
-# ---------- TAB 2: YOUTH ----------
-with tab2:
-    st.subheader("Youth — make-it probabilities")
-    if scores_youth is None:
-        st.info("`scores_youth` tab missing. Generate in Colab (Cell 15).")
-    else:
-        df = scores_youth.copy()
-        c1, c2, c3, c4 = st.columns(4)
-        pos_list = sorted(df["position_group"].dropna().unique()) if "position_group" in df.columns else []
-        pos_sel  = c1.multiselect("Position(s)", pos_list, default=pos_list, key="y_pos")
-        pmin     = c2.slider("Min probability", 0.0, 1.0, 0.50, 0.01, key="y_pmin")
-        search   = c3.text_input("Search name", "", key="y_search")
-        sort_desc= c4.checkbox("Sort by probability (desc)", True, key="y_sort")
-
-        filt = pd.Series(True, index=df.index)
-        if pos_list and "position_group" in df.columns: filt &= df["position_group"].isin(pos_sel)
-        if "p_make_it" in df.columns: filt &= df["p_make_it"].fillna(0) >= pmin
-        if search: filt &= df.get("player_name", pd.Series("", index=df.index)).astype(str).str.lower().str.contains(search.lower(), na=False)
-        dfv = df[filt].copy()
-
-        if sort_desc and "p_make_it" in dfv.columns:
-            dfv = dfv.sort_values("p_make_it", ascending=False)
-        elif set(["position_group","p_make_it"]).issubset(dfv.columns):
-            dfv = dfv.sort_values(["position_group","p_make_it"], ascending=[True, False])
-
-        show = [c for c in ["player_name","position_group","age","p_make_it",
-                            "adj_minutes","availability_pct","role_percentile"] if c in dfv.columns]
-        disp = dfv.copy()
-        if "p_make_it" in disp.columns: disp["p_make_it"] = disp["p_make_it"].map(percent)
-        if "availability_pct" in disp.columns: disp["availability_pct"] = disp["availability_pct"].map(percent)
-        if "role_percentile" in disp.columns: disp["role_percentile"] = disp["role_percentile"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
-        st.dataframe(disp[show], use_container_width=True, hide_index=True)
-
-# ---------- TAB 3: PLAYER PROFILE ----------
-with tab3:
-    st.subheader("Player Profile — search & score")
-    colA, colB = st.columns([2,1])
-
-    # Build a simple search index from players + raw matches
-    candidates = []
-    if not players_df.empty and "player_name" in players_df.columns:
-        candidates = sorted(players_df["player_name"].dropna().astype(str).unique().tolist())
-    if not raw_matches.empty and "player_name" in raw_matches.columns:
-        candidates = sorted(set(list(candidates) + raw_matches["player_name"].dropna().astype(str).unique().tolist()))
-    q = colA.text_input("Search player by name", "", key="pp_q")
-    pick = None
-    if q:
-        picks = fuzzy_pick(candidates, q, limit=5)
-        pick = colA.selectbox("Matches", picks, index=0 if picks else None, key="pp_pick")
-
-    # Optional: choose by tm_id
-    tm_pick = colB.text_input("…or paste Transfermarkt URL/ID", "", key="pp_tm")
-    tm_id = parse_tm_id(tm_pick)
-
-    if st.button("Load profile", key="pp_load"):
-        st.session_state["_pp_go"] = True
-
-    if st.session_state.get("_pp_go"):
-        # Resolve tm_id and name
-        name = pick or q
-        if tm_id and not players_df.empty and "tm_id" in players_df.columns:
-            row = players_df.loc[players_df["tm_id"].astype(str)==str(tm_id)].head(1)
-            if not row.empty:
-                name = row.iloc[0].get("player_name", name)
-        st.markdown(f"### {name}")
-
-        # Join latest features → ratings
-        feats = build_feature_store(ss)
-        ages = players_df[["tm_id","age"]] if ("tm_id" in players_df.columns and "age" in players_df.columns) else pd.DataFrame()
-        ratings = compute_ratings_from_features(feats, ages)
-
-        # Filter to this player
-        mask = (ratings["player_name"].str.lower()==str(name).lower())
-        if tm_id:
-            mask |= (ratings["tm_id"].astype(str)==str(tm_id))
-        r = ratings.loc[mask].tail(1)
-
-        if r.empty:
-            st.info("No stats ingested for this player yet. Upload in **Admin / Data → Upload stats**.")
+    if st.session_state.get("_pp"):
+        target_name = st.session_state["_pp"]["name"]
+        target_tm = st.session_state["_pp"]["tm_id"]
+        # find rating row
+        rr = pd.DataFrame()
+        if not ratings.empty:
+            rr = ratings[(ratings["player_name"].str.lower()==str(target_name).lower()) | (ratings["tm_id"].astype(str)==str(target_tm))].tail(1)
+        st.markdown(f"### {target_name}")
+        if rr.empty:
+            st.info("No ratings yet for this player. Upload stats in **Admin / Data**.")
         else:
-            row = r.iloc[0]
-            c1, c2, c3, c4 = st.columns(4)
-            c1.markdown(f"<div class='djm-card djm-kpi'><div class='big'>{row['overall_now']:.1f}</div><div class='label'>Overall now</div></div>", unsafe_allow_html=True)
-            c2.markdown(f"<div class='djm-card djm-kpi'><div class='big'>{row['overall_5yr']:.1f}</div><div class='label'>Projected 5-yr</div></div>", unsafe_allow_html=True)
-            c3.markdown(f"<div class='djm-card djm-kpi'><div class='big'>{int(row['minutes_90'])}</div><div class='label'>Minutes</div></div>", unsafe_allow_html=True)
+            row = rr.iloc[0]
+            kc1, kc2, kc3, kc4 = st.columns(4)
+            gauge(row["overall_now"], "Overall now")
+            gauge(row["overall_5yr"], "Projected 5-yr")
+            kc3.markdown("<div class='djm-card'>", unsafe_allow_html=True)
+            st.progress(min(1.0, float(row["minutes_90"] or 0)/3000.0), text=f"Minutes {int(row['minutes_90'])}")
+            st.markdown("</div>", unsafe_allow_html=True)
+            # TM market value (best-effort)
             tm_url = None
-            if not players_df.empty and "tm_url" in players_df.columns:
-                cand = players_df.loc[players_df["player_name"].str.lower()==str(name).lower()]
+            if not players.empty and "tm_url" in players.columns:
+                cand = players[players["player_name"].str.lower()==str(target_name).lower()]
                 tm_url = cand.iloc[0]["tm_url"] if not cand.empty else None
-            mv = fetch_tm_value_eur(tm_url) if tm_url else None
-            c4.markdown(f"<div class='djm-card djm-kpi'><div class='big'>{mv if mv else '—'}</div><div class='label'>TM value (best-effort)</div></div>", unsafe_allow_html=True)
+            mv = best_effort_tm_value(tm_url, settings.get("tm_value_fetch", True))
+            kpi_card("TM value (best-effort)", mv or "—")
 
-            st.markdown("#### Breakdown")
-            st.write("This rating is a transparent blend of attack, progression, defence and passing, normalized within your imported dataset.")
+            st.markdown("#### Radar (from per-90 blocks)")
+            if not feats.empty:
+                # build last features for player
+                f = feats[(feats["player_name"].str.lower()==str(target_name).lower()) | (feats["tm_id"].astype(str)==str(target_tm))].tail(1)
+                if not f.empty:
+                    blocks = {
+                        "Attack": float(100*norm_01_series(0.6*f["xg_p90"]+0.4*f["xa_p90"]+0.2*f["shots_p90"]+0.4*f["kp_p90"]).iloc[0]),
+                        "Progress": float(100*norm_01_series(0.6*f["prog_pass_p90"]+0.4*f["prog_carry_p90"]+0.2*f["dribbles_p90"]).iloc[0]),
+                        "Defence": float(100*norm_01_series(0.6*f["tackles_p90"]+0.6*f["inter_p90"]+0.2*f["aerials_p90"]).iloc[0]),
+                        "Passing": float(100*norm_01_series(f["pass_acc"]).iloc[0]),
+                    }
+                    radar(blocks, "Skill blend (relative to dataset)")
+                else:
+                    st.info("No feature rows found for this player.")
 
-# ---------- TAB 4: ADMIN / DATA ----------
-with tab4:
-    st.subheader("Admin — Players & Stats Ingestion")
+# ---------------------------- TAB: CLUB PROFILE & COMPARE ------------
+with tab_club:
+    st.subheader("Club Profile & Compare")
+    rosters = read_sheet(ss, "club_rosters")
+    if rosters.empty:
+        st.info("No `club_rosters` yet. Upload in Admin / Data → ‘Upload club roster CSV’ (tm_id, player_name, club_name, position_group, minutes).")
+    else:
+        clubs = sorted(rosters["club_name"].dropna().astype(str).unique())
+        club = st.selectbox("Club", clubs)
+        view = rosters[rosters["club_name"]==club].merge(ratings[["tm_id","overall_now","overall_5yr"]], on="tm_id", how="left")
+        c1, c2 = st.columns(2)
+        if not view.empty:
+            c1.dataframe(view[["player_name","position_group","minutes","overall_now","overall_5yr"]].sort_values("overall_now", ascending=False), use_container_width=True, hide_index=True)
+            # band plot
+            band = view["overall_now"].dropna()
+            if not band.empty:
+                fig = go.Figure()
+                fig.add_trace(go.Box(y=band, name="XI band", boxpoints='outliers'))
+                fig.update_layout(height=320, paper_bgcolor="rgba(0,0,0,0)")
+                c2.plotly_chart(fig, use_container_width=True)
+        st.markdown("#### Compare a target")
+        target = st.text_input("Player name (must exist in players/ratings or roster)", "")
+        if target:
+            r_target = ratings[ratings["player_name"].str.lower()==target.lower()].tail(1)
+            if r_target.empty:
+                st.warning("No rating found for that player.")
+            else:
+                t_now = float(r_target.iloc[0]["overall_now"])
+                st.write(f"**{target} now:** {t_now:.1f}")
+                if not view.empty and "overall_now" in view.columns:
+                    q1, q3 = view["overall_now"].quantile(0.25), view["overall_now"].quantile(0.75)
+                    msg = "inside XI band" if q1 <= t_now <= q3 else ("above XI band" if t_now > q3 else "below XI band")
+                    st.success(f"Fit vs {club}: **{msg}**  (XI IQR: {q1:.1f}–{q3:.1f})")
 
-    with st.expander("➕ Add / update a player (name + Transfermarkt URL/ID)", expanded=False):
+# ---------------------------- TAB: ROLES & ARCHETYPES ----------------
+with tab_roles:
+    st.subheader("Roles & Archetypes (KMeans)")
+    if st.button("Rebuild role clusters", key="roles_rebuild"):
+        rebuild_roles(ss)
+        roles = read_sheet(ss, "roles")
+        st.success("Roles rebuilt.")
+
+    if roles.empty:
+        st.info("No roles yet. Rebuild using button above after you have features.")
+    else:
+        pg = st.selectbox("Position group", ["FW","MF","DF","GK"])
+        rview = roles[roles["position_group"]==pg]
+        if rview.empty:
+            st.info("No players for this group.")
+        else:
+            fig = go.Figure()
+            for lab, grp in rview.groupby("role_label"):
+                fig.add_trace(go.Scatter(x=grp["pca_x"], y=grp["pca_y"], mode="markers", name=lab, text=grp["player_name"]))
+            fig.update_layout(height=480, paper_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(rview[["player_name","role_label","role_cluster"]].sort_values(["role_label","player_name"]), use_container_width=True, hide_index=True)
+
+# ---------------------------- TAB: ADMIN / DATA ---------------------
+with tab_admin:
+    st.subheader("Admin — Players, Stats, Rebuild")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Add / update a player")
         pname = st.text_input("Player name *", key="adm_name")
-        tm_input = st.text_input("Transfermarkt URL or ID *", key="adm_tm")
-        pid = st.text_input("Your player_id (optional)", key="adm_pid")
-        p_qid = st.text_input("Wikidata Q-ID (optional, e.g., Q11886275)", key="adm_qid")
-        dob = st.text_input("DOB (optional, YYYY-MM-DD)", key="adm_dob")
-        if st.button("Add / Update player", key="adm_add"):
-            tm = parse_tm_id(tm_input)
+        tm_in = st.text_input("Transfermarkt URL/ID *", key="adm_tm")
+        pos_txt = st.text_input("Positions (text, e.g., 'LW/ST' or 'CB')", key="adm_pos")
+        club = st.text_input("Current club (optional)", key="adm_club")
+        dob = st.text_input("DOB (YYYY-MM-DD) (optional)", key="adm_dob")
+        if st.button("Upsert player", key="adm_up"):
+            tm = parse_tm_id(tm_in)
             if not pname or not tm:
-                st.error("Need player name and a valid Transfermarkt URL/ID.")
+                st.error("Need player name + valid Transfermarkt URL/ID.")
             else:
                 rec = pd.DataFrame([{
-                    "player_id": pid, "player_name": pname, "player_qid": p_qid,
-                    "dob": dob, "tm_url": tm_input, "tm_id": tm
+                    "player_name":pname, "tm_url":tm_in, "tm_id":tm,
+                    "positions":pos_txt, "position_group": position_group_from_text(pos_txt),
+                    "current_club": club, "dob": dob
                 }])
                 ins, upd = upsert_players(ss, rec)
-                st.success(f"Done. Inserted {ins}, Updated {upd}. See `players` tab in Sheet.")
+                st.success(f"Inserted {ins}, Updated {upd}. See `players` sheet.")
 
-    st.divider()
-    st.markdown("### 📥 Upload stats (Excel/CSV) → append to `raw_matches`")
-    st.caption("Drop per-match stats like your ‘PlayerStats’ sheet. We auto-map common columns.")
-
-    file = st.file_uploader("Upload .xlsx or .csv", type=["xlsx","csv"], key="adm_upload")
-    if file is not None:
-        if file.name.lower().endswith(".xlsx"):
+        st.divider()
+        st.markdown("### Upload player match stats (Excel/CSV) → `raw_matches`")
+        upload = st.file_uploader("Upload .xlsx or .csv", type=["xlsx","csv"], key="adm_file")
+        tm_rows = st.text_input("Transfermarkt URL/ID for these rows (optional)", key="adm_tm_rows")
+        tm_rows_id = parse_tm_id(tm_rows) if tm_rows else None
+        if upload is not None:
+            # read
+            df_in = None
             try:
-                df_in = pd.read_excel(file, sheet_name=0)
+                if upload.name.lower().endswith(".xlsx"):
+                    df_in = pd.read_excel(upload, sheet_name=0)
+                else:
+                    df_in = pd.read_csv(upload)
             except Exception:
-                st.error("Could not read Excel.")
-                df_in = None
-        else:
-            try:
-                df_in = pd.read_csv(file)
-            except Exception:
-                file.seek(0)
-                df_in = pd.read_csv(file, encoding="utf-8", engine="python")
-
-        if df_in is not None and not df_in.empty:
-            st.write("Preview of uploaded data:")
-            st.dataframe(df_in.head(15), use_container_width=True, hide_index=True)
-
-            # ---- Heuristic mapping for your sample columns ----
-            cols = {c.lower(): c for c in df_in.columns}
-            def find(*keys):
-                for k in keys:
-                    for c in cols:
-                        if k in c:
-                            return cols[c]
-                return None
-
-            map_guess = {
-                "player_name": find("player", "name"),
-                "date": find("date"),
-                "competition": find("competition","league"),
-                "opponent": find("opponent"),
-                "minutes": find("minute"),
-                "shots": find("shots"),
-                "xg": find("xg"),
-                "xa": find("xa"),
-                "key_passes": find("key passes"),
-                "dribbles_won": find("dribbles won"),
-                "progressive_passes": find("progressive passes"),
-                "progressive_carries": find("progressive carries"),
-                "tackles_won": find("tackles won","tackles"),
-                "interceptions": find("interceptions"),
-                "aerials_won": find("aerials won"),
-                "passes": find("passes /","passes"),
-                "passes_accurate": find("unnamed:","accurate"),  # many exports have adjacent 'Unnamed' accurate cols
-                "duels_won": find("duels won"),
-                "touches": find("touches"),
-                "position": find("position"),
-            }
-
-            st.write("**Auto-mapped fields** (you can edit below):")
-            cols1, cols2, cols3 = st.columns(3)
-            keys = list(map_guess.keys())
-            for i,k in enumerate(keys):
-                (cols1 if i%3==0 else cols2 if i%3==1 else cols3).text_input(k, value=map_guess[k] or "", key=f"map_{k}")
-
-            tm_url_or_id = st.text_input("Transfermarkt URL/ID for these rows (optional — we’ll store tm_id on all rows)", key="adm_tm_rows")
-            tm_id_for_rows = parse_tm_id(tm_url_or_id) if tm_url_or_id else None
-
-            if st.button("Append to raw_matches", key="adm_append"):
-                # Build output rows
-                out_rows = []
-                for idx, r in df_in.iterrows():
-                    row = {h:"" for h in RAW_MATCHES_HEADERS}
-                    # mapping
+                upload.seek(0)
+                try:
+                    df_in = pd.read_csv(upload, encoding="utf-8", engine="python")
+                except Exception:
+                    st.error("Could not read file.")
+            if df_in is not None and not df_in.empty:
+                st.dataframe(df_in.head(15), use_container_width=True, hide_index=True)
+                # mapping guess
+                cols = {c.lower(): c for c in df_in.columns}
+                def find(*keys):
                     for k in keys:
-                        src = st.session_state.get(f"map_{k}", "")
-                        if src and src in df_in.columns:
-                            row[k] = r[src]
-                    row["tm_id"] = tm_id_for_rows or ""
-                    out_rows.append(row)
-                out_df = pd.DataFrame(out_rows)
-                # coerce date if needed
-                if "date" in out_df.columns:
-                    out_df["date"] = pd.to_datetime(out_df["date"], errors="coerce").dt.date.astype(str)
-                added = append_raw_matches(ss, out_df)
-                st.success(f"Appended {added} match rows to `raw_matches` in your Google Sheet.")
+                        for c in cols:
+                            if k in c:
+                                return cols[c]
+                    return ""
+                st.markdown("**Field mapping (edit if needed):**")
+                m = {}
+                grid = [
+                    ("player_name",("player","name")),
+                    ("date",("date","match date")),
+                    ("competition",("competition","league")),
+                    ("opponent",("opponent","rival")),
+                    ("minutes",("minute","min")),
+                    ("shots",("shots",)),
+                    ("xg",("xg",)),
+                    ("xa",("xa",)),
+                    ("key_passes",("key passes","key_pass")),
+                    ("progressive_passes",("progressive passes","prog pass")),
+                    ("progressive_carries",("progressive carries","prog carr")),
+                    ("dribbles_won",("dribbles won","dribble")),
+                    ("tackles_won",("tackles won","tackle")),
+                    ("interceptions",("interceptions",)),
+                    ("aerials_won",("aerials won","aerial")),
+                    ("passes",("passes /","passes")),
+                    ("passes_accurate",("accurate","unnamed")),
+                    ("touches",("touches",)),
+                    ("duels_won",("duels won","duel")),
+                    ("position",("position","pos"))
+                ]
+                cA, cB, cC = st.columns(3)
+                for i,(k,keys) in enumerate(grid):
+                    default = find(*keys)
+                    m[k] = (cA if i%3==0 else cB if i%3==1 else cC).text_input(k, value=default, key=f"map_{k}")
 
-                # Rebuild ratings preview immediately
-                feats = build_feature_store(ss)
-                ages = players_df[["tm_id","age"]] if ("tm_id" in players_df.columns and "age" in players_df.columns) else pd.DataFrame()
-                ratings = compute_ratings_from_features(feats, ages)
-                if not ratings.empty:
-                    write_df_to_sheet(ss, "ratings", ratings.reindex(columns=RATINGS_HEADERS))
-                    st.info("Rebuilt `ratings` tab.")
-                    st.dataframe(ratings.tail(10), use_container_width=True, hide_index=True)
+                if st.button("Append to raw_matches", key="append_raw"):
+                    rows = []
+                    for _, r in df_in.iterrows():
+                        row = {h:"" for h in RAW_MATCHES_HEADERS}
+                        for k in m:
+                            src = st.session_state.get(f"map_{k}", "")
+                            if src and src in df_in.columns:
+                                row[k] = r[src]
+                        if tm_rows_id: row["tm_id"] = tm_rows_id
+                        # coerce date
+                        if row.get("date",""):
+                            try:
+                                row["date"] = dtparser.parse(str(row["date"])).date().isoformat()
+                            except Exception:
+                                pass
+                        rows.append(row)
+                    added = append_raw_matches(ss, pd.DataFrame(rows))
+                    st.success(f"Appended {added} rows to `raw_matches`.")
 
-st.caption("All numbers are explainable. Upload more stats to improve ratings. Use Player Profile to sanity-check individual cases.")
+    with col2:
+        st.markdown("### Rebuild Feature Store & Ratings")
+        if st.button("Rebuild feature_store", key="rebuild_feats"):
+            rebuild_feature_store(ss)
+            st.success("Feature store rebuilt.")
+        if st.button("Rebuild ratings", type="primary", key="rebuild_ratings"):
+            rebuild_ratings(ss, settings)
+            settings["last_build"] = now_ts()
+            save_settings(ss, settings)
+            st.success("Ratings rebuilt. See `ratings` tab.")
+        st.divider()
+        st.markdown("### Upload club roster CSV → `club_rosters`")
+        st.caption("Columns required: tm_id, player_name, club_name, position_group, minutes")
+        roster = st.file_uploader("Upload roster CSV", type=["csv"], key="adm_roster")
+        if roster is not None:
+            try:
+                df_r = pd.read_csv(roster)
+                need = {"tm_id","player_name","club_name","position_group","minutes"}
+                if not need.issubset(set(df_r.columns)):
+                    st.error(f"Missing columns: {need - set(df_r.columns)}")
+                else:
+                    write_sheet(ss, "club_rosters", df_r[["tm_id","player_name","club_name","position_group","minutes"]])
+                    st.success("club_rosters updated.")
+            except Exception as e:
+                st.error(f"Failed to read roster: {e}")
+
+# ---------------------------- TAB: SETTINGS -------------------------
+with tab_settings:
+    st.subheader("Weights & Toggles")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Block weights (sum ≈ 1)**")
+        settings["w_attack"] = st.slider("Attack", 0.0, 1.0, float(settings["w_attack"]), 0.01)
+        settings["w_progression"] = st.slider("Progression", 0.0, 1.0, float(settings["w_progression"]), 0.01)
+        settings["w_defence"] = st.slider("Defence", 0.0, 1.0, float(settings["w_defence"]), 0.01)
+        settings["w_passing"] = st.slider("Passing", 0.0, 1.0, float(settings["w_passing"]), 0.01)
+    with c2:
+        st.markdown("**Age curve & projection**")
+        settings["age_curve_u21"] = st.slider("Age ≤21 multiplier", 0.8, 1.3, float(settings["age_curve_u21"]), 0.01)
+        settings["age_curve_22_24"] = st.slider("22–24", 0.8, 1.3, float(settings["age_curve_22_24"]), 0.01)
+        settings["age_curve_25_28"] = st.slider("25–28", 0.8, 1.3, float(settings["age_curve_25_28"]), 0.01)
+        settings["age_curve_29_31"] = st.slider("29–31", 0.7, 1.2, float(settings["age_curve_29_31"]), 0.01)
+        settings["age_curve_32_34"] = st.slider("32–34", 0.7, 1.2, float(settings["age_curve_32_34"]), 0.01)
+        settings["age_curve_35p"] = st.slider("35+", 0.6, 1.1, float(settings["age_curve_35p"]), 0.01)
+        settings["projection_u22"] = st.slider("Projection ≤22", 0.9, 1.3, float(settings["projection_u22"]), 0.01)
+        settings["projection_23_26"] = st.slider("Projection 23–26", 0.9, 1.2, float(settings["projection_23_26"]), 0.01)
+        settings["projection_30p"] = st.slider("Projection ≥30", 0.8, 1.1, float(settings["projection_30p"]), 0.01)
+        settings["minutes_shrink_lt900"] = st.slider("Shrink <900 mins", 0.5, 1.0, float(settings["minutes_shrink_lt900"]), 0.01)
+        settings["minutes_shrink_900_1799"] = st.slider("Shrink 900–1799", 0.6, 1.0, float(settings["minutes_shrink_900_1799"]), 0.01)
+        settings["tm_value_fetch"] = st.toggle("Best-effort TM value fetch (HTML parse)", value=bool(settings.get("tm_value_fetch", True)))
+
+    if st.button("Save settings", type="primary"):
+        save_settings(ss, settings)
+        st.success("Saved. Rebuild ratings to apply.")
+
+st.caption("DJM © — Automated, explainable scouting. Upload stats → roles → ratings → deals.")
