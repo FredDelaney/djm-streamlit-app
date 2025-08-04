@@ -1,7 +1,11 @@
-# DJM — SCOUTING & TRANSFER PLATFORM (robust V2)
-# - Runs even if rapidfuzz/plotly/sklearn are missing (degrades gracefully).
-# - Modern UI, Ratings & Projection, Club Compare, Roles (if sklearn present),
-#   Admin ingestion (Excel/CSV -> raw_matches), Players upsert (TM URL/ID).
+# DJM — Scouting & Transfer Intelligence (Monolith V2 — enhanced)
+# ----------------------------------------------------------------------
+# V2 Design Goals (building on V1):
+# - Enhanced Modelling: Introduce league strength modifiers and positional normalization.
+# - Credible Uncertainty: Replace static uncertainty with a minutes-played-driven model.
+# - Richer Player Insights: Add radar charts for visual profiling and a "Similar Players" feature.
+# - Improved UX: Automate club roster generation and refine UI components.
+# - Code Quality & Maintainability: Add type hinting and centralize configuration.
 
 import streamlit as st
 import pandas as pd
@@ -9,18 +13,19 @@ import numpy as np
 import pytz, re, requests, json
 from datetime import datetime
 from dateutil import parser as dtparser
+from typing import List, Dict, Any, Optional, Tuple
 
-# ---------- Optional deps (graceful fallbacks) ----------
+# -------- Optional deps (graceful fallbacks) --------
 # Fuzzy search
 try:
     from rapidfuzz import process as _fuzz
-    def fuzzy_pick(options, query, limit=8, score_cutoff=65):
+    def fuzzy_pick(options: List[str], query: str, limit: int = 8, score_cutoff: int = 65) -> List[str]:
         if not options or not query: return []
         hits = _fuzz.extract(query, options, limit=limit, score_cutoff=score_cutoff)
         return [h[0] for h in hits]
 except Exception:
     import difflib
-    def fuzzy_pick(options, query, limit=8, score_cutoff=0):
+    def fuzzy_pick(options: List[str], query: str, limit: int = 8, score_cutoff: float = 0.0) -> List[str]:
         if not options or not query: return []
         return difflib.get_close_matches(query, options, n=limit, cutoff=0.0)
 
@@ -31,119 +36,114 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-# Clustering (roles)
+# Clustering & Similarity
 try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.cluster import KMeans
     from sklearn.decomposition import PCA
+    from sklearn.metrics.pairwise import cosine_similarity
     SKLEARN_OK = True
 except Exception:
     SKLEARN_OK = False
 
-# ---------- Google Sheets ----------
+# -------- Google Sheets I/O --------
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
-# ---------- App config & theme ----------
+# -------- App chrome & CSS --------
 st.set_page_config(page_title="DJM — Scouting & Transfers", layout="wide", initial_sidebar_state="expanded")
-st.markdown("""
-<style>
-:root { --accent:#5B8CFF; --bg:#0B1020; --card:#121933; --muted:#9aa4b2; --good:#00E88F; --warn:#F2C94C; --bad:#FF6B6B; }
-.stApp { background: radial-gradient(1200px 800px at 10% 0%, #0B1020 0%, #0A1228 40%, #0B1020 100%); color:#E9F1FF; }
-.djm-card { background:var(--card); border-radius:16px; padding:18px; border:1px solid rgba(255,255,255,.06); box-shadow:0 20px 40px rgba(0,0,0,.35); }
-.djm-kpi .big { font-size:40px; font-weight:900; letter-spacing:.2px; }
+THEME_CSS = """
+:root { --accent:#69E2FF; --bg:#0A0F1F; --card:#121935; --muted:#9aa4b2; --good:#00E88F; --warn:#F2C94C; --bad:#FF6B6B; }
+.stApp { background: radial-gradient(1300px 800px at 10% 0%, #0A0F1F 0%, #0B1228 40%, #0A0F1F 100%); color:#E9F1FF; }
+.djm-card { background:var(--card); border-radius:16px; padding:18px; border:1px solid rgba(255,255,255,.06); box-shadow:0 18px 38px rgba(0,0,0,.35); }
+.djm-kpi .big { font-size:38px; font-weight:900; letter-spacing:.2px; }
 .djm-kpi .label { color:var(--muted); text-transform:uppercase; font-size:12px; letter-spacing:.3px; }
-.stButton>button { border-radius:12px; padding:8px 14px; font-weight:600; background:linear-gradient(120deg, #5B8CFF, #6BD6FF); color:#0B1020; border:0; }
+.stButton>button { border-radius:12px; padding:8px 14px; font-weight:600; background:linear-gradient(120deg, #5B8CFF, #69E2FF); color:#0B1020; border:0; }
+.st-emotion-cache-1kyxreq { border-radius:12px; } /* Progress bar container */
 [data-testid="stDataFrame"] { border-radius:12px; overflow:hidden; border:1px solid rgba(255,255,255,.08); }
-</style>
-""", unsafe_allow_html=True)
+h3 { margin-top: 1.5rem; }
+"""
+st.markdown(f"<style>{THEME_CSS}</style>", unsafe_allow_html=True)
 
-# ---------- Settings ----------
+# -------- Settings & Contracts --------
 SHEET_NAME = st.secrets.get("sheet_name", "DJM_Input")
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive.readonly"]
 
+# Dataframe column contracts
 PLAYERS_HEADERS = [
     "player_id","player_name","player_qid","dob","age","citizenships",
     "height_cm","positions","position_group","current_club","shirt_number",
-    "tm_url","tm_id"
+    "contract_until", "tm_url","tm_id"
 ]
-
 RAW_MATCHES_HEADERS = [
     "tm_id","player_name","date","competition","opponent","minutes",
-    "shots","xg","xa","key_passes",
-    "progressive_passes","progressive_carries",
-    "dribbles_won","tackles_won","interceptions","aerials_won",
-    "passes","passes_accurate","touches","duels_won","position"
+    "shots","xg","xa","key_passes","progressive_passes","progressive_carries",
+    "dribbles_won","tackles_won","interceptions","aerials_won","passes",
+    "passes_accurate","touches","duels_won","position"
 ]
-
 FEATURE_STORE_COLS = [
-    "tm_id","player_name","minutes",
-    "xg_p90","xa_p90","shots_p90","kp_p90",
-    "prog_pass_p90","prog_carry_p90","dribbles_p90",
-    "tackles_p90","inter_p90","aerials_p90","pass_acc"
+    "tm_id","player_name","minutes","xg_p90","xa_p90","shots_p90","kp_p90",
+    "prog_pass_p90","prog_carry_p90","dribbles_p90","tackles_p90","inter_p90",
+    "aerials_p90","pass_acc"
 ]
-
 RATINGS_HEADERS = [
     "tm_id","player_name","position_group","age",
-    "overall_now","overall_5yr","uncert_low","uncert_high",
-    "minutes_90","availability","role_fit","market_signal","updated_at"
+    "overall_now","potential","uncert_now",
+    "minutes_90","league_adj","availability","role_fit","market_signal","updated_at"
 ]
-
+DEFAULT_LEAGUE_FACTORS = {"Premier League": 1.0, "LaLiga": 0.95, "Bundesliga": 0.94, "Serie A": 0.93, "Ligue 1": 0.88, "Eredivisie": 0.80, "Default": 0.70}
 DEFAULT_SETTINGS = {
     "w_attack": 0.35, "w_progression": 0.25, "w_defence": 0.20, "w_passing": 0.20,
-    "age_curve_u21": 1.10, "age_curve_22_24": 1.05, "age_curve_25_28": 1.00,
-    "age_curve_29_31": 0.97, "age_curve_32_34": 0.94, "age_curve_35p": 0.90,
-    "projection_u22": 1.10, "projection_23_26": 1.04, "projection_30p": 0.98,
-    "minutes_shrink_lt900": 0.70, "minutes_shrink_900_1799": 0.85,
-    "tm_value_fetch": True
+    "age_peak_start": 25, "age_peak_end": 28,
+    "potential_growth_factor": 1.15,
+    "minutes_confidence_floor": 450, "minutes_confidence_ceiling": 2200,
+    "league_factors": json.dumps(DEFAULT_LEAGUE_FACTORS),
+    "tm_value_fetch": True, "last_build": "—"
 }
 
-# ---------- GSheet I/O ----------
-@st.cache_resource(show_spinner=False)
-def connect_gsheet():
+# -------- Utilities --------
+def now_ts() -> str:
+    tz = pytz.timezone("Europe/Rome")
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
+
+@st.cache_resource(show_spinner="Connecting to Google Sheets...")
+def connect_sheet() -> gspread.Spreadsheet:
     creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
     client = gspread.authorize(creds)
     return client.open(SHEET_NAME)
 
-def get_or_create_ws(ss, name, headers=None):
+def get_or_create_ws(ss: gspread.Spreadsheet, name: str, headers: Optional[List[str]] = None) -> gspread.Worksheet:
     try:
         ws = ss.worksheet(name)
-    except Exception:
+    except gspread.WorksheetNotFound:
         ws = ss.add_worksheet(title=name, rows=2000, cols=max(30, len(headers or [])))
         if headers:
             ws.update('A1', [headers])
     return ws
 
-def read_sheet(ss, name):
+@st.cache_data(ttl=300)
+def read_tab(_ss: gspread.Spreadsheet, name: str) -> pd.DataFrame:
     try:
-        ws = ss.worksheet(name)
-    except Exception:
+        ws = _ss.worksheet(name)
+    except gspread.WorksheetNotFound:
         return pd.DataFrame()
     df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
-    if df is None:
-        return pd.DataFrame()
-    return df.dropna(how="all")
+    return pd.DataFrame() if df is None else df.dropna(how="all")
 
-def write_sheet(ss, name, df):
+def write_tab(ss: gspread.Spreadsheet, name: str, df: pd.DataFrame):
     ws = get_or_create_ws(ss, name, headers=list(df.columns))
     ws.clear()
-    set_with_dataframe(ws, df, row=1, col=1, include_index=False, include_column_header=True)
+    set_with_dataframe(ws, df.fillna(""), row=1, col=1, include_index=False, include_column_header=True)
+    st.cache_data.clear() # Invalidate cache after writing
 
-def now_ts():
-    tz = pytz.timezone("Europe/Rome")
-    return datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
-
-# ---------- Settings persist ----------
-def load_settings(ss):
-    df = read_sheet(ss, "settings")
+def load_settings(ss: gspread.Spreadsheet) -> Dict[str, Any]:
+    df = read_tab(ss, "settings")
     if df.empty: return DEFAULT_SETTINGS.copy()
     s = DEFAULT_SETTINGS.copy()
     for _, r in df.iterrows():
-        k = str(r.get("key","")).strip(); v = r.get("value","")
+        k = str(r.get("key","")).strip()
+        v = r.get("value","")
         if not k: continue
         try: s[k] = json.loads(v)
         except Exception:
@@ -151,12 +151,22 @@ def load_settings(ss):
             except Exception: s[k] = v
     return s
 
-def save_settings(ss, settings):
-    rows = [{"key":k,"value":json.dumps(v)} for k,v in settings.items()]
-    write_sheet(ss, "settings", pd.DataFrame(rows, columns=["key","value"]))
+def save_settings(ss: gspread.Spreadsheet, settings: Dict[str, Any]):
+    rows = [{"key":k,"value":str(v) if not isinstance(v, (dict, list)) else json.dumps(v)} for k,v in settings.items()]
+    write_tab(ss, "settings", pd.DataFrame(rows, columns=["key","value"]))
 
-# ---------- Helpers ----------
-def parse_tm_id(url_or_id: str):
+# .str-safe helpers
+def col_str(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns or df.empty: return pd.Series([], dtype=str)
+    return df[col].astype(str).replace({"nan":"","None":"", "NaT":""})
+
+def eq_name(df: pd.DataFrame, col: str, target: str) -> pd.Series:
+    return col_str(df, col).str.lower() == (str(target or "").lower())
+
+def eq_id(df: pd.DataFrame, col: str, target: Optional[str]) -> pd.Series:
+    return col_str(df, col) == (str(target or ""))
+
+def parse_tm_id(url_or_id: str) -> Optional[str]:
     if not url_or_id: return None
     s = str(url_or_id).strip()
     m = re.search(r"/spieler/(\d+)", s)
@@ -174,36 +184,60 @@ def position_group_from_text(txt: str) -> str:
     if any(w in t for w in ["fw","st","wing","w","strik","att"]): return "FW"
     return ""
 
-def percent(x):
-    try: return f"{100*float(x):.1f}%"
-    except Exception: return ""
+def safe_div(a,b) -> float:
+    try:
+        if pd.isna(a) or pd.isna(b) or float(b)==0: return np.nan
+        return float(a)/float(b)
+    except Exception: return np.nan
 
-def best_effort_tm_value(tm_url: str, enabled=True):
+def norm_by_group(s: pd.Series) -> pd.Series:
+    if s is None or s.empty: return s
+    # Winsorize at 5th and 95th percentiles to handle outliers robustly
+    lo, hi = np.nanpercentile(s, 5), np.nanpercentile(s, 95)
+    if hi == lo: return pd.Series(0.5, index=s.index) # Avoid division by zero for constant series
+    return ((s - lo) / (hi - lo)).clip(0, 1)
+
+def best_effort_tm_value(tm_url: str, enabled: bool = True) -> Optional[str]:
     if not enabled or not tm_url: return None
     try:
         r = requests.get(tm_url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
         if r.status_code != 200: return None
         m = re.search(r"Market value[^€£]*([€£]\s?[\d\.,]+[mk]?)", r.text, re.I)
         return m.group(1).replace(" ","") if m else None
-    except Exception:
-        return None
+    except Exception: return None
 
-def norm01(s: pd.Series):
-    if s is None or s.empty: return s
-    lo, hi = np.nanpercentile(s, 5), np.nanpercentile(s, 95)
-    return (s - lo) / (hi - lo + 1e-9)
+# -------- V2: UI Components --------
+def plot_radar_chart(stats: Dict[str, float], title: str) -> go.Figure:
+    categories = list(stats.keys())
+    values = list(stats.values())
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=values,
+        theta=categories,
+        fill='toself',
+        line_color='var(--accent)',
+        marker=dict(color='var(--accent)'),
+        name='Score'
+    ))
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, 100], color='var(--muted)', gridcolor='rgba(255,255,255,0.1)'),
+            angularaxis=dict(color='var(--muted)', linecolor='rgba(255,255,255,0.1)')
+        ),
+        showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=300,
+        margin=dict(l=40, r=40, t=60, b=40),
+        title=dict(text=title, font=dict(color='#E9F1FF'))
+    )
+    return fig
 
-def safe_div(a,b):
-    try:
-        if pd.isna(a) or pd.isna(b) or float(b)==0: return np.nan
-        return float(a)/float(b)
-    except Exception:
-        return np.nan
-
-# ---------- Upserts / ingestion ----------
-def upsert_players(ss, df_in: pd.DataFrame):
+# -------- Admin upserts & ingestion --------
+def upsert_players(ss: gspread.Spreadsheet, df_in: pd.DataFrame) -> Tuple[int, int]:
+    # (This function is largely the same as V1, but adapted for new headers)
     _ = get_or_create_ws(ss, "players", headers=PLAYERS_HEADERS)
-    existing = read_sheet(ss, "players")
+    existing = read_tab(ss, "players")
     if existing.empty: existing = pd.DataFrame(columns=PLAYERS_HEADERS)
 
     df = df_in.copy()
@@ -212,149 +246,246 @@ def upsert_players(ss, df_in: pd.DataFrame):
 
     df["tm_id"] = df.apply(lambda r: r["tm_id"] if pd.notna(r["tm_id"]) and str(r["tm_id"]).strip()!=""
                            else parse_tm_id(str(r.get("tm_url",""))), axis=1)
-    # auto position_group if missing
     for i, r in df.iterrows():
         if not str(r.get("position_group","")).strip():
             df.at[i, "position_group"] = position_group_from_text(str(r.get("positions","")))
-    for c in ["player_id","player_name","player_qid","dob","tm_url","tm_id","position_group","positions","current_club"]:
-        df[c] = df[c].astype(str).str.strip().replace({"None":"","nan":""})
+
+    str_cols = ["player_id","player_name","player_qid","dob","tm_url","tm_id","position_group","positions","current_club", "contract_until"]
+    for c in str_cols:
+        if c in df.columns: df[c] = col_str(df, c).str.strip()
 
     existing = existing.reindex(columns=PLAYERS_HEADERS).fillna("")
-    ex_by_tm = {str(t): i for i,t in enumerate(existing["tm_id"].astype(str)) if t}
+    ex_by_tm = {str(t): i for i,t in enumerate(col_str(existing,"tm_id")) if t}
     ex_by_name_dob = {(str(n).lower(), str(d)): i for i,(n,d)
-                      in enumerate(zip(existing["player_name"].astype(str), existing["dob"].astype(str))) if n}
+                      in enumerate(zip(col_str(existing,"player_name"), col_str(existing, "dob"))) if n}
 
     ins, upd = 0, 0
     for _, r in df.iterrows():
         tm_id = str(r["tm_id"]) if pd.notna(r["tm_id"]) else ""
-        idx = ex_by_tm.get(tm_id) if tm_id else None
-        if idx is None:
-            idx = ex_by_name_dob.get((str(r["player_name"]).lower(), str(r["dob"])))
+        idx = ex_by_tm.get(tm_id) if tm_id else ex_by_name_dob.get((str(r["player_name"]).lower(), str(r["dob"])))
+
         if idx is None:
             row = {h: str(r[h]) if h in r.index and pd.notna(r[h]) else "" for h in PLAYERS_HEADERS}
             existing = pd.concat([existing, pd.DataFrame([row])], ignore_index=True)
             ins += 1
         else:
             for h in PLAYERS_HEADERS:
-                val = r[h] if h in r.index else ""
-                if pd.notna(val) and str(val)!="":
+                val = r[h] if h in r.index and pd.notna(r[h]) else ""
+                if str(val) != "":
                     existing.iat[idx, existing.columns.get_loc(h)] = str(val)
             upd += 1
 
-    write_sheet(ss, "players", existing.reindex(columns=PLAYERS_HEADERS))
+    write_tab(ss, "players", existing.reindex(columns=PLAYERS_HEADERS))
     return ins, upd
 
-def append_raw_matches(ss, df_rows: pd.DataFrame):
-    ws = get_or_create_ws(ss, "raw_matches", headers=RAW_MATCHES_HEADERS)
-    existing = read_sheet(ss, "raw_matches")
-    if existing.empty: existing = pd.DataFrame(columns=RAW_MATCHES_HEADERS)
-    out = pd.concat([existing, df_rows.reindex(columns=RAW_MATCHES_HEADERS)], ignore_index=True)
-    write_sheet(ss, "raw_matches", out)
-    return len(df_rows)
+def guess_map(df: pd.DataFrame) -> Dict[str, str]:
+    cols = {c.lower().replace("_", " ").strip(): c for c in df.columns}
+    def find(*keys):
+        for k in keys:
+            for c_norm, c_orig in cols.items():
+                if k in c_norm: return c_orig
+        return ""
+    return {
+        "player_name": find("player","name"), "date": find("date","match date"),
+        "competition": find("competition","league"), "opponent": find("opponent","rival"),
+        "minutes": find("minute","min"), "shots": find("shots"), "xg": find("xg"),
+        "xa": find("xa"), "key_passes": find("key passes", "kp"),
+        "progressive_passes": find("progressive passes", "prog pass"),
+        "progressive_carries": find("progressive carries", "prog carr"),
+        "dribbles_won": find("dribbles won", "dribble"), "tackles_won": find("tackles won", "tackle"),
+        "interceptions": find("interceptions", "int"), "aerials_won": find("aerials won", "aerial"),
+        "passes": find("passes completed", "passes", "pass att"),
+        "passes_accurate": find("accurate", "pass cmp"), "touches": find("touches"),
+        "duels_won": find("duels won", "duel"), "position": find("position","pos")
+    }
 
-# ---------- Feature store / ratings ----------
-def rebuild_feature_store(ss):
-    raw = read_sheet(ss, "raw_matches")
-    if raw.empty:
-        write_sheet(ss, "feature_store", pd.DataFrame(columns=FEATURE_STORE_COLS))
-        return
+def append_raw_matches(ss: gspread.Spreadsheet, df_in: pd.DataFrame, tm_id_for_rows: Optional[str] = None) -> int:
+    # (Largely same as V1)
+    if df_in is None or df_in.empty: return 0
+    m = guess_map(df_in)
+    out_rows = []
+    for _, r in df_in.iterrows():
+        row = {h:"" for h in RAW_MATCHES_HEADERS}
+        for k, src in m.items():
+            if src and src in df_in.columns: row[k] = r[src]
+        if tm_id_for_rows: row["tm_id"] = tm_id_for_rows
+        if row.get("date",""):
+            try: row["date"] = dtparser.parse(str(row["date"])).date().isoformat()
+            except Exception: pass
+        out_rows.append(row)
+    existing = read_tab(ss, "raw_matches")
+    out = pd.concat([existing, pd.DataFrame(out_rows)], ignore_index=True)
+    write_tab(ss, "raw_matches", out[RAW_MATCHES_HEADERS])
+    return len(out_rows)
+
+# -------- Core Logic: Feature Store & Ratings (V2 Enhancements) --------
+@st.cache_data(show_spinner="Building feature store...")
+def build_feature_store(_ss: gspread.Spreadsheet) -> pd.DataFrame:
+    raw = read_tab(_ss, "raw_matches")
+    if raw.empty: return pd.DataFrame(columns=FEATURE_STORE_COLS)
+    
     num_cols = ["minutes","xg","xa","shots","key_passes","progressive_passes","progressive_carries",
                 "dribbles_won","tackles_won","interceptions","aerials_won","passes","passes_accurate","touches","duels_won"]
     for c in num_cols:
         if c in raw.columns: raw[c] = pd.to_numeric(raw[c], errors="coerce")
-    g = raw.groupby(["tm_id","player_name"], dropna=False).agg({
-        "minutes":"sum","xg":"sum","xa":"sum","shots":"sum","key_passes":"sum",
-        "progressive_passes":"sum","progressive_carries":"sum","dribbles_won":"sum",
-        "tackles_won":"sum","interceptions":"sum","aerials_won":"sum",
-        "passes":"sum","passes_accurate":"sum"
-    }).reset_index()
+
+    # Aggregate stats per player
+    g = raw.groupby(["tm_id","player_name"], dropna=False).agg({c: "sum" for c in num_cols}).reset_index()
+    
+    # Calculate per-90 metrics
     mins = g["minutes"].replace({0:np.nan})
     feats = pd.DataFrame({
         "tm_id": g["tm_id"], "player_name": g["player_name"], "minutes": g["minutes"],
-        "xg_p90": g["xg"]/mins*90, "xa_p90": g["xa"]/mins*90, "shots_p90": g["shots"]/mins*90, "kp_p90": g["key_passes"]/mins*90,
-        "prog_pass_p90": g["progressive_passes"]/mins*90, "prog_carry_p90": g["progressive_carries"]/mins*90,
-        "dribbles_p90": g["dribbles_won"]/mins*90, "tackles_p90": g["tackles_won"]/mins*90,
-        "inter_p90": g["interceptions"]/mins*90, "aerials_p90": g["aerials_won"]/mins*90,
+        "xg_p90": g["xg"]/mins*90, "xa_p90": g["xa"]/mins*90, "shots_p90": g["shots"]/mins*90,
+        "kp_p90": g["key_passes"]/mins*90, "prog_pass_p90": g["progressive_passes"]/mins*90,
+        "prog_carry_p90": g["progressive_carries"]/mins*90, "dribbles_p90": g["dribbles_won"]/mins*90,
+        "tackles_p90": g["tackles_won"]/mins*90, "inter_p90": g["interceptions"]/mins*90,
+        "aerials_p90": g["aerials_won"]/mins*90,
         "pass_acc": g.apply(lambda r: safe_div(r["passes_accurate"], r["passes"]), axis=1)
     })
-    write_sheet(ss, "feature_store", feats.reindex(columns=FEATURE_STORE_COLS))
+    
+    write_tab(_ss, "feature_store", feats.reindex(columns=FEATURE_STORE_COLS))
+    return feats
 
-def age_mult(age, s):  # settings map
+# V2: NEW - Model for age-based performance curve
+def age_curve_multiplier(age: float, settings: Dict) -> float:
     if pd.isna(age): return 1.0
-    a = float(age)
-    if a <= 21: return s["age_curve_u21"]
-    if a <= 24: return s["age_curve_22_24"]
-    if a <= 28: return s["age_curve_25_28"]
-    if a <= 31: return s["age_curve_29_31"]
-    if a <= 34: return s["age_curve_32_34"]
-    return s["age_curve_35p"]
+    peak_start, peak_end = settings["age_peak_start"], settings["age_peak_end"]
+    if age < peak_start: return 1.0 + (peak_start - age) * 0.01 # Gentle incline for youth
+    if age > peak_end: return 1.0 - (age - peak_end) * 0.015 # Steadier decline for veterans
+    return 1.0 # Peak years
 
-def proj_growth(age, s):
-    if pd.isna(age): return 1.03
-    a = float(age)
-    if a <= 22: return s["projection_u22"]
-    if a <= 26: return s["projection_23_26"]
-    if a >= 30: return s["projection_30p"]
-    return 1.00
+# V2: NEW - Model for uncertainty based on minutes
+def uncertainty_from_minutes(minutes: float, settings: Dict) -> float:
+    m = 0 if pd.isna(minutes) else float(minutes)
+    floor, ceil = settings["minutes_confidence_floor"], settings["minutes_confidence_ceiling"]
+    if m < floor: return 20.0 # High uncertainty for low minutes
+    if m > ceil: return 5.0  # Low uncertainty for high minutes
+    # Linear interpolation of uncertainty between floor and ceiling
+    return 20.0 - (m - floor) / (ceil - floor) * 15.0
 
-def mins_shrink(m, s):
-    m = 0 if pd.isna(m) else float(m)
-    if m < 900: return s["minutes_shrink_lt900"]
-    if m < 1800: return s["minutes_shrink_900_1799"]
-    return 1.00
+@st.cache_data(show_spinner="Rebuilding all player ratings...")
+def rebuild_ratings(_ss: gspread.Spreadsheet, settings: Dict) -> pd.DataFrame:
+    feats = read_tab(_ss, "feature_store")
+    players = read_tab(_ss, "players")
+    raw = read_tab(_ss, "raw_matches")
+    if feats.empty or players.empty: return pd.DataFrame(columns=RATINGS_HEADERS)
 
-def rebuild_ratings(ss, settings):
-    feats = read_sheet(ss, "feature_store")
-    players = read_sheet(ss, "players")
-    if feats.empty:
-        write_sheet(ss, "ratings", pd.DataFrame(columns=RATINGS_HEADERS)); return
-    att = norm01(0.6*feats["xg_p90"].fillna(0) + 0.4*feats["xa_p90"].fillna(0) + 0.2*feats["shots_p90"].fillna(0) + 0.4*feats["kp_p90"].fillna(0))
-    prog = norm01(0.6*feats["prog_pass_p90"].fillna(0) + 0.4*feats["prog_carry_p90"].fillna(0) + 0.2*feats["dribbles_p90"].fillna(0))
-    dfn = norm01(0.6*feats["tackles_p90"].fillna(0) + 0.6*feats["inter_p90"].fillna(0) + 0.2*feats["aerials_p90"].fillna(0))
-    pas = norm01(feats["pass_acc"].fillna(0))
-    base01 = (settings["w_attack"]*att + settings["w_progression"]*prog + settings["w_defence"]*dfn + settings["w_passing"]*pas).clip(0,1)
-    lookup = players[["tm_id","age","position_group"]] if not players.empty else pd.DataFrame(columns=["tm_id","age","position_group"])
-    df = feats[["tm_id","player_name","minutes"]].copy().join(base01.rename("base01"))
-    df = df.merge(lookup, on="tm_id", how="left")
-    now = (df["base01"] * df["age"].map(lambda a: age_mult(a, settings)).fillna(1.0)).clip(0,1)*100.0
-    proj5 = (now/100.0 * df["age"].map(lambda a: proj_growth(a, settings)).fillna(1.03) * df["minutes"].map(lambda m: mins_shrink(m, settings))).clip(0,1)*100.0
+    # V2: Join with player and raw data for position and league info
+    df = feats.merge(players[["tm_id", "age", "position_group"]], on="tm_id", how="left")
+    
+    # V2: Apply League Strength adjustment
+    league_factors = json.loads(settings.get("league_factors", json.dumps(DEFAULT_LEAGUE_FACTORS)))
+    
+    if not raw.empty and 'competition' in raw.columns:
+        # Calculate avg league factor per player
+        raw['league_factor'] = raw['competition'].map(lambda x: league_factors.get(x, league_factors["Default"]))
+        league_adj_map = raw.groupby('tm_id')['league_factor'].mean()
+        df['league_adj'] = df['tm_id'].map(league_adj_map).fillna(league_factors["Default"])
+    else:
+        df['league_adj'] = league_factors["Default"]
+        
+    # V2: Positional Normalization
+    # Normalize performance metrics *within* each position group
+    block_scores = pd.DataFrame(index=df.index)
+    for pg, group in df.groupby("position_group"):
+        if group.empty: continue
+        att  = norm_by_group(0.6*group["xg_p90"] + 0.4*group["xa_p90"] + 0.2*group["shots_p90"] + 0.4*group["kp_p90"])
+        prog = norm_by_group(0.6*group["prog_pass_p90"] + 0.4*group["prog_carry_p90"] + 0.2*group["dribbles_p90"])
+        dfn  = norm_by_group(0.6*group["tackles_p90"] + 0.6*group["inter_p90"] + 0.2*group["aerials_p90"])
+        pas  = norm_by_group(group["pass_acc"])
+        
+        # Calculate weighted base score for the group
+        base01 = (settings["w_attack"]*att + settings["w_progression"]*prog + settings["w_defence"]*dfn + settings["w_passing"]*pas).clip(0,1)
+        block_scores.loc[group.index, 'base01'] = base01
+    
+    df = df.join(block_scores)
+    df['base01'] = df['base01'].fillna(0)
+    
+    # Calculate final scores
+    players_age = pd.to_numeric(df["age"], errors='coerce')
+    age_mult = players_age.map(lambda a: age_curve_multiplier(a, settings))
+    
+    # Current Ability: Base score * Age Curve * League Adjustment
+    now = (df["base01"] * age_mult * df["league_adj"]).clip(0,1) * 100.0
+    
+    # Potential: Based on age and current ability. Younger players with high CA have more room to grow.
+    potential = (now * (1 + (settings["age_peak_start"] - players_age).clip(0) / 100 * (1 - now/100))).clip(now, 100)
+    
+    # Final DataFrame
     out = pd.DataFrame({
-        "tm_id": df["tm_id"], "player_name": df["player_name"],
-        "position_group": df["position_group"].fillna(""), "age": df["age"],
-        "overall_now": now.round(1), "overall_5yr": proj5.round(1),
-        "uncert_low": (now*0.90).round(1), "uncert_high": (now*1.10).clip(0,100).round(1),
-        "minutes_90": df["minutes"].fillna(0).round(0),
+        "tm_id": df["tm_id"], "player_name": df["player_name"], "position_group": df["position_group"].fillna(""),
+        "age": df["age"], "overall_now": now.round(1), "potential": potential.round(1),
+        "uncert_now": df["minutes"].map(lambda m: uncertainty_from_minutes(m, settings)).round(1),
+        "minutes_90": (df["minutes"].fillna(0)/90).round(1),
+        "league_adj": df["league_adj"].round(2),
         "availability": np.nan, "role_fit": np.nan, "market_signal": np.nan,
-        "updated_at": now_ts()
+        "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     })
-    write_sheet(ss, "ratings", out.reindex(columns=RATINGS_HEADERS))
+    
+    write_tab(_ss, "ratings", out.reindex(columns=RATINGS_HEADERS))
+    return out
 
-# ---------- Roles (only if sklearn exists) ----------
+# -------- V2: Similarity & Roles --------
+@st.cache_data(show_spinner="Finding similar players...")
+def find_similar_players(_target_tm_id: str, _feats: pd.DataFrame, _players: pd.DataFrame, n: int = 5) -> pd.DataFrame:
+    if not SKLEARN_OK or _target_tm_id not in _feats['tm_id'].values: return pd.DataFrame()
+
+    # Ensure consistent dtypes
+    for col in ROLE_FEATURES:
+        if col in _feats.columns: _feats[col] = pd.to_numeric(_feats[col], errors='coerce')
+
+    # Merge to get position group
+    df = _feats.merge(_players[['tm_id', 'position_group']], on='tm_id', how='left')
+    target_player = df[df['tm_id'] == _target_tm_id]
+    if target_player.empty: return pd.DataFrame()
+    target_pg = target_player['position_group'].iloc[0]
+
+    # Filter for players in the same position group
+    candidate_pool = df[df['position_group'] == target_pg].copy()
+    candidate_pool = candidate_pool.drop_duplicates(subset=['tm_id']) # Ensure unique players
+    
+    if len(candidate_pool) < 2: return pd.DataFrame()
+
+    # Prepare feature matrix
+    X = candidate_pool[ROLE_FEATURES].fillna(0.0).values
+    X_scaled = StandardScaler().fit_transform(X)
+    
+    # Find target player's vector
+    target_idx = candidate_pool['tm_id'].to_list().index(_target_tm_id)
+    target_vector = X_scaled[target_idx].reshape(1, -1)
+    
+    # Compute cosine similarity
+    sim_scores = cosine_similarity(target_vector, X_scaled)[0]
+    candidate_pool['similarity'] = sim_scores
+    
+    # Return top N similar players (excluding the player themselves)
+    similar = candidate_pool.sort_values('similarity', ascending=False).iloc[1:n+1]
+    return similar[['player_name', 'tm_id', 'similarity']]
+
+# Role building function (unchanged from V1)
 ROLE_FEATURES = ["xg_p90","xa_p90","shots_p90","kp_p90","prog_pass_p90","prog_carry_p90","dribbles_p90","tackles_p90","inter_p90","aerials_p90","pass_acc"]
 ROLE_LABELS = {
-    "FW": ["Channel 9","Target 9","Wide Inside Fwd","Winger","Second Striker"],
-    "MF": ["Box-to-Box 8","Deep Playmaker 6","Ball-Winning 6/8","Advanced 8/10","Progressor 8"],
-    "DF": ["Ball-Playing CB","Stopper CB","Inverted FB","Overlapping FB","Wing-Back"],
-    "GK": ["Sweeper GK","Shot-Stopper GK"]
+    "FW": ["Channel Runner","Target Forward","Inside Forward","Classic Winger","Shadow Striker"],
+    "MF": ["Box-to-Box Midfielder","Deep-Lying Playmaker","Ball-Winning Midfielder","Advanced Playmaker","Wide Midfielder"],
+    "DF": ["Ball-Playing Defender","No-Nonsense Centre-Back","Inverted Full-Back","Overlapping Full-Back","Wing-Back"],
+    "GK": ["Sweeper Keeper","Shot-Stopper"]
 }
-
-def rebuild_roles(ss, n_clusters_per_group=4):
-    if not SKLEARN_OK:
-        write_sheet(ss, "roles", pd.DataFrame(columns=["tm_id","player_name","position_group","role_cluster","role_label","pca_x","pca_y"]))
-        return
-    feats = read_sheet(ss, "feature_store")
-    players = read_sheet(ss, "players")
-    if feats.empty or players.empty:
-        write_sheet(ss, "roles", pd.DataFrame(columns=["tm_id","player_name","position_group","role_cluster","role_label","pca_x","pca_y"]))
+def rebuild_roles(ss, n_clusters=4): # (No major changes needed for V2)
+    feats = read_tab(ss, "feature_store")
+    players = read_tab(ss, "players")
+    if not SKLEARN_OK or feats.empty or players.empty:
+        write_tab(ss, "roles", pd.DataFrame(columns=["tm_id","player_name","position_group","role_cluster","role_label","pca_x","pca_y"]))
         return
     df = feats.merge(players[["tm_id","position_group"]], on="tm_id", how="left")
     out = []
     for pg in ["FW","MF","DF","GK"]:
         sub = df[df["position_group"]==pg].copy()
-        if sub.empty: continue
+        if len(sub) < n_clusters: continue
         X = sub[ROLE_FEATURES].fillna(0.0).values
         X = StandardScaler().fit_transform(X)
-        k = min(n_clusters_per_group, max(1, len(sub)//8))
+        k = min(n_clusters, max(1, len(sub)//8))
+        if k==0: continue
         km = KMeans(n_clusters=k, n_init="auto", random_state=42).fit(X)
         pca = PCA(n_components=2, random_state=42).fit_transform(X)
         labels = km.labels_
@@ -365,338 +496,342 @@ def rebuild_roles(ss, n_clusters_per_group=4):
             "role_cluster": labels, "role_label": human, "pca_x": pca[:,0], "pca_y": pca[:,1]
         }))
     roles = pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=["tm_id","player_name","position_group","role_cluster","role_label","pca_x","pca_y"])
-    write_sheet(ss, "roles", roles)
+    write_tab(ss, "roles", roles)
 
-# ---------- Sidebar / connect ----------
+# ---------------- App Starts Here ----------------
+
+# ---------------- Sidebar: connect & data load ----------------
 with st.sidebar:
     st.header("Data source")
     try:
-        ss = connect_gsheet()
-        st.success("Connected ✅")
-    except Exception:
-        st.error("Cannot open Google Sheet. Check `.streamlit/secrets.toml` & sharing.")
+        ss = connect_sheet()
+        st.success(f"Connected to '{SHEET_NAME}'")
+    except Exception as e:
+        st.error(f"GSheets connection failed. Check secrets & sharing. Details: {e}")
         st.stop()
-    st.caption(f"Sheet: **{SHEET_NAME}** · {now_ts()}")
-    refresh = st.button("🔄 Refresh", use_container_width=True)
+    st.caption(f"Last updated: {now_ts()}")
+    refresh = st.button("🔄 Refresh Data", use_container_width=True)
+    if refresh: st.cache_data.clear()
 
-players      = read_sheet(ss, "players")
-raw_matches  = read_sheet(ss, "raw_matches")
-feats        = read_sheet(ss, "feature_store")
-ratings      = read_sheet(ss, "ratings")
-roles        = read_sheet(ss, "roles")
-settings     = load_settings(ss)
+# State-managed data loading
+@st.cache_data(show_spinner="Loading database sheets...")
+def load_all_data(_ss: gspread.Spreadsheet):
+    data = {
+        "players": read_tab(_ss, "players"),
+        "raw": read_tab(_ss, "raw_matches"),
+        "feats": read_tab(_ss, "feature_store"),
+        "ratings": read_tab(_ss, "ratings"),
+        "roles": read_tab(_ss, "roles"),
+        "settings": load_settings(_ss)
+    }
+    return data
 
-if refresh:
-    players = read_sheet(ss, "players")
-    raw_matches = read_sheet(ss, "raw_matches")
-    feats = read_sheet(ss, "feature_store")
-    ratings = read_sheet(ss, "ratings")
-    roles = read_sheet(ss, "roles")
-    settings = load_settings(ss)
+data = load_all_data(ss)
+players, raw, feats, ratings, roles, settings = data.values()
 
-# ---------- Header ----------
+# ---------------- Header -------------------------
 st.markdown(
-    "<div class='djm-card'><div style='font-size:28px;font-weight:800;'>DJM Scouting & Transfer Intelligence</div>"
-    "<div style='color:#9aa4b2'>Search, score, roles, club fit. Upload Excel/CSV to grow your dataset.</div></div>",
+    "<div class='djm-card'><div style='font-size:28px;font-weight:800;'>DJM — Scouting & Transfer Intelligence</div>"
+    "<div style='color:#9aa4b2'>V2: Positional Normalization · League Adjustments · Similarity Search · Dynamic Insights</div></div>",
     unsafe_allow_html=True
 )
 st.write("")
 
-# ---------- Tabs ----------
-tab_dash, tab_profile, tab_club, tab_roles, tab_admin, tab_settings = st.tabs(
-    ["Dashboard", "Search / Player Profile", "Club Profile & Compare", "Roles", "Admin / Data", "Settings"]
+# ---------------- Tabs ---------------------------
+tab_dash, tab_player, tab_club, tab_roles, tab_admin, tab_settings = st.tabs(
+    ["Dashboard", "👤 Player Profile", "🏟️ Club Analysis", "🧩 Roles & Similarity", "⚙️ Admin", "🔧 Settings"]
 )
 
-# ===== DASHBOARD =====
+# ===== Dashboard =====
 with tab_dash:
-    def kpi(label, val):
-        st.markdown(f"<div class='djm-card djm-kpi'><div class='big'>{val}</div><div class='label'>{label}</div></div>", unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
-    kpi("Players", len(players) if not players.empty else 0)
-    kpi("Match rows", len(raw_matches) if not raw_matches.empty else 0)
-    kpi("Rated players", len(ratings["tm_id"].unique()) if not ratings.empty else 0)
-    kpi("Last build", settings.get("last_build","—"))
-    st.subheader("Top ratings (snapshot)")
+    def kpi(c, label, val): c.markdown(f"<div class='djm-card djm-kpi'><div class='big'>{val}</div><div class='label'>{label}</div></div>", unsafe_allow_html=True)
+    kpi(c1,"Players in DB", len(players) if not players.empty else 0)
+    kpi(c2,"Match Logs", f"{len(raw):,}" if not raw.empty else 0)
+    kpi(c3,"Rated Players", len(ratings["tm_id"].unique()) if not ratings.empty and "tm_id" in ratings.columns else 0)
+    kpi(c4,"Last Model Build", settings.get("last_build","—"))
+    
+    st.subheader("Leaderboard")
     if ratings.empty:
-        st.info("No ratings yet. Go to **Admin / Data** to rebuild after uploading stats.")
+        st.info("No ratings found. Go to Admin → Rebuild feature_store → Rebuild ratings.")
     else:
-        st.dataframe(
-            ratings.sort_values("overall_now", ascending=False).head(30)[
-                ["player_name","position_group","age","overall_now","overall_5yr","minutes_90"]
-            ],
-            use_container_width=True, hide_index=True
-        )
+        sort_by = st.selectbox("Sort by", ["Overall Now", "Potential"], horizontal=True)
+        sort_col = "overall_now" if sort_by == "Overall Now" else "potential"
+        
+        display_cols = ["player_name", "position_group", "age", "overall_now", "potential", "uncert_now", "minutes_90", "league_adj"]
+        display_ratings = ratings.copy()
+        display_ratings['overall_now'] = display_ratings['overall_now'].map('{:,.1f}'.format)
+        display_ratings['potential'] = display_ratings['potential'].map('{:,.1f}'.format)
 
-# ===== PLAYER PROFILE =====
-with tab_profile:
-    st.subheader("Search & Player Profile")
-    all_names = sorted(set(
-        list(players.get("player_name", pd.Series([],dtype=str)).dropna().astype(str)) +
-        list(ratings.get("player_name", pd.Series([],dtype=str)).dropna().astype(str))
-    ))
-    q = st.text_input("Type a player name", "")
-    picks = fuzzy_pick(all_names, q, limit=8) if q else []
-    name = st.selectbox("Pick", options=picks, index=0 if picks else None, placeholder="Select…")
-    tm_input = st.text_input("…or paste Transfermarkt URL/ID", "")
-    tm_id = parse_tm_id(tm_input)
-    if st.button("Load profile", type="primary"):
-        st.session_state["_pp"] = {"name": name or q, "tm_id": tm_id}
+        st.dataframe(display_ratings.sort_values(sort_col, ascending=False).head(25)[display_cols],
+                       use_container_width=True, hide_index=True)
 
-    if st.session_state.get("_pp"):
-        target_name = st.session_state["_pp"]["name"]
-        target_tm   = st.session_state["_pp"]["tm_id"]
-        st.markdown(f"### {target_name}")
-        rr = pd.DataFrame()
-        if not ratings.empty:
-            rr = ratings[(ratings["player_name"].str.lower()==str(target_name).lower()) |
-                         (ratings["tm_id"].astype(str)==str(target_tm))].tail(1)
-        if rr.empty:
-            st.info("No ratings yet for this player. Upload stats in **Admin / Data** and rebuild.")
+# ===== Player Profile =====
+with tab_player:
+    st.subheader("Player Search")
+    all_names = sorted(set(list(col_str(players,"player_name")) + list(col_str(ratings,"player_name"))))
+    
+    sc1, sc2 = st.columns([3, 1])
+    q = sc1.text_input("Search by player name...", placeholder="e.g., Jude Bellingham")
+    picks = fuzzy_pick(all_names, q, limit=10) if q else []
+    name = sc1.selectbox("Select Player", options=picks, index=0 if picks else None, label_visibility="collapsed")
+    
+    if sc2.button("Load Profile", type="primary", use_container_width=True) and name:
+        st.session_state["selected_player_name"] = name
+
+    if "selected_player_name" in st.session_state:
+        target_name = st.session_state["selected_player_name"]
+        
+        # Get player data from all tables
+        p_info = players[eq_name(players, "player_name", target_name)].iloc[-1:]
+        p_rating = ratings[eq_name(ratings, "player_name", target_name)].iloc[-1:]
+        p_feat = feats[eq_name(feats, "player_name", target_name)].iloc[-1:]
+        
+        if p_rating.empty:
+            st.warning(f"No rating found for '{target_name}'. Please process their stats in the Admin panel.")
         else:
-            row = rr.iloc[0]
-            if PLOTLY_OK:
-                # Gauge charts
-                def gauge(value, title):
-                    fig = go.Figure(go.Indicator(mode="gauge+number", value=float(value),
-                                                 number={'font': {'size': 30}},
-                                                 gauge={'axis': {'range': [0, 100]},
-                                                        'bar': {'color': '#5B8CFF'},
-                                                        'bgcolor': "#0B1020",
-                                                        'borderwidth': 1,'bordercolor': "rgba(255,255,255,.15)"}))
-                    fig.update_layout(height=220, margin=dict(l=10,r=10,t=30,b=10), paper_bgcolor="rgba(0,0,0,0)", title=title)
-                    st.plotly_chart(fig, use_container_width=True, theme=None)
-                c1, c2, c3 = st.columns(3)
-                gauge(row["overall_now"], "Overall now")
-                gauge(row["overall_5yr"], "Projected 5-yr")
-                # minutes bar
+            p_info = p_info.iloc[0] if not p_info.empty else {}
+            p_rating = p_rating.iloc[0]
+            target_tm_id = p_rating.get('tm_id')
+
+            st.markdown(f"<hr style='margin:1.5rem 0; border-color: rgba(255,255,255,0.1);'>", unsafe_allow_html=True)
+            st.markdown(f"### {target_name}")
+
+            # --- Bio & Core Metrics ---
+            col1, col2 = st.columns([1, 2])
+            with col1:
                 st.markdown("<div class='djm-card'>", unsafe_allow_html=True)
-                st.progress(min(1.0, float(row["minutes_90"] or 0)/3000.0), text=f"Minutes {int(row['minutes_90'])}")
+                st.markdown(f"""
+                **Position:** {p_rating.get('position_group', 'N/A')} <br>
+                **Age:** {p_rating.get('age', 'N/A')} <br>
+                **Club:** {p_info.get('current_club', 'N/A')} <br>
+                **Citizenship:** {p_info.get('citizenships', 'N/A')} <br>
+                **Height:** {p_info.get('height_cm', 'N/A')} cm <br>
+                **Contract:** Until {p_info.get('contract_until', 'N/A')}
+                """, unsafe_allow_html=True)
+                mv = best_effort_tm_value(p_info.get("tm_url"), settings.get("tm_value_fetch", True))
+                st.caption(f"TM Value: **{mv or '—'}**")
                 st.markdown("</div>", unsafe_allow_html=True)
-            else:
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Overall now", f"{row['overall_now']:.1f}")
-                c2.metric("Projected 5-yr", f"{row['overall_5yr']:.1f}")
-                c3.metric("Minutes", f"{int(row['minutes_90'])}")
 
-            tm_url = None
-            if not players.empty and "tm_url" in players.columns:
-                cand = players[players["player_name"].str.lower()==str(target_name).lower()]
-                tm_url = cand.iloc[0]["tm_url"] if not cand.empty else None
-            if settings.get("tm_value_fetch", True):
-                mv = best_effort_tm_value(tm_url, True)
-                st.caption(f"TM value (best-effort): {mv or '—'}")
+            with col2:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Overall Now", f"{p_rating['overall_now']:.1f}", f"± {p_rating['uncert_now']:.1f} uncertainty")
+                m2.metric("Potential", f"{p_rating['potential']:.1f}")
+                m3.metric("Minutes (last season)", f"{p_rating['minutes_90']*90:,.0f}")
+                st.progress(min(1.0, float(p_rating["minutes_90"]*90 or 0)/settings["minutes_confidence_ceiling"]), text=f"Data Confidence (based on mins)")
 
-            # Radar blocks if features exist
-            f = feats[(feats["player_name"].str.lower()==str(target_name).lower()) |
-                      (feats["tm_id"].astype(str)==str(target_tm))].tail(1)
-            if not f.empty and PLOTLY_OK:
-                blocks = {
-                    "Attack": float(100*norm01(0.6*f["xg_p90"]+0.4*f["xa_p90"]+0.2*f["shots_p90"]+0.4*f["kp_p90"]).iloc[0]),
-                    "Progress": float(100*norm01(0.6*f["prog_pass_p90"]+0.4*f["prog_carry_p90"]+0.2*f["dribbles_p90"]).iloc[0]),
-                    "Defence": float(100*norm01(0.6*f["tackles_p90"]+0.6*f["inter_p90"]+0.2*f["aerials_p90"]).iloc[0]),
-                    "Passing": float(100*norm01(f["pass_acc"]).iloc[0]),
-                }
-                labels = list(blocks.keys()) + [list(blocks.keys())[0]]
-                vals = list(blocks.values()) + [list(blocks.values())[0]]
-                fig = go.Figure()
-                fig.add_trace(go.Scatterpolar(r=vals, theta=labels, fill='toself', name='Score', line=dict(width=2)))
-                fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=False,
-                                  height=360, margin=dict(l=10,r=10,t=30,b=10), paper_bgcolor="rgba(0,0,0,0)", title="Skill blend")
-                st.plotly_chart(fig, use_container_width=True, theme=None)
+            # --- Radar Chart & Similar Players ---
+            st.markdown("### Statistical Profile")
+            col_radar, col_sim = st.columns(2)
+            with col_radar:
+                if not p_feat.empty and PLOTLY_OK:
+                    f = p_feat.iloc[0]
+                    # Get the raw un-normalized scores for the radar
+                    att_score  = norm_by_group(0.6*f["xg_p90"] + 0.4*f["xa_p90"] + 0.2*f["shots_p90"] + 0.4*f["kp_p90"]) * 100
+                    prog_score = norm_by_group(0.6*f["prog_pass_p90"] + 0.4*f["prog_carry_p90"] + 0.2*f["dribbles_p90"]) * 100
+                    dfn_score  = norm_by_group(0.6*f["tackles_p90"] + 0.6*f["inter_p90"] + 0.2*f["aerials_p90"]) * 100
+                    pas_score  = norm_by_group(f["pass_acc"]) * 100
+                    radar_stats = {
+                        "Attacking": att_score, "Progression": prog_score,
+                        "Defending": dfn_score, "Passing": pas_score
+                    }
+                    st.plotly_chart(plot_radar_chart(radar_stats, "Core Skill Areas"), use_container_width=True, theme=None)
+                else:
+                    st.info("Plotly not available or no features for radar chart.")
 
-# ===== CLUB PROFILE & COMPARE =====
+            with col_sim:
+                st.markdown("<p style='text-align:center; font-weight:bold;'>Statistically Similar Players</p>", unsafe_allow_html=True)
+                with st.spinner("Searching for matches..."):
+                    similar_df = find_similar_players(target_tm_id, feats, players, n=5)
+                    if not similar_df.empty:
+                        similar_df['similarity'] = (similar_df['similarity'] * 100).map('{:.1f}%'.format)
+                        st.dataframe(similar_df[['player_name', 'similarity']], use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Not enough data to find similar players in the same position group.")
+
+# ===== Club Analysis =====
 with tab_club:
-    st.subheader("Club Profile & Compare")
-    rosters = read_sheet(ss, "club_rosters")
-    if rosters.empty:
-        st.info("Upload `club_rosters` in Admin (columns: tm_id, player_name, club_name, position_group, minutes).")
+    st.subheader("Club Squad Analysis")
+    if players.empty or ratings.empty:
+        st.info("Requires `players` and `ratings` data. Please add players and build ratings in the Admin panel.")
     else:
-        clubs = sorted(rosters["club_name"].dropna().astype(str).unique())
-        club = st.selectbox("Club", clubs)
-        view = rosters[rosters["club_name"]==club].merge(ratings[["tm_id","overall_now","overall_5yr"]], on="tm_id", how="left")
-        c1, c2 = st.columns(2)
-        c1.dataframe(view[["player_name","position_group","minutes","overall_now","overall_5yr"]]
-                     .sort_values("overall_now", ascending=False),
-                     use_container_width=True, hide_index=True)
-        if PLOTLY_OK and not view["overall_now"].dropna().empty:
-            fig = go.Figure()
-            fig.add_trace(go.Box(y=view["overall_now"].dropna(), name="XI band", boxpoints='outliers'))
-            fig.update_layout(height=320, paper_bgcolor="rgba(0,0,0,0)")
-            c2.plotly_chart(fig, use_container_width=True)
-        st.markdown("#### Compare a target")
-        target = st.text_input("Player name", "")
-        if target:
-            r_target = ratings[ratings["player_name"].str.lower()==target.lower()].tail(1)
-            if r_target.empty:
-                st.warning("No rating for that player.")
-            else:
-                t_now = float(r_target.iloc[0]["overall_now"])
-                st.write(f"**{target} now:** {t_now:.1f}")
-                band = view["overall_now"].dropna()
-                if not band.empty:
-                    q1, q3 = band.quantile(0.25), band.quantile(0.75)
-                    msg = "inside XI band" if q1 <= t_now <= q3 else ("above XI band" if t_now > q3 else "below XI band")
-                    st.success(f"Fit vs {club}: **{msg}** (IQR {q1:.1f}–{q3:.1f})")
+        # V2: Dynamic roster generation from players table
+        all_clubs = sorted(col_str(players,"current_club").unique())
+        club = st.selectbox("Select a Club", all_clubs, index=all_clubs.index('Manchester City') if 'Manchester City' in all_clubs else 0)
+        
+        # Merge players at the selected club with their ratings
+        roster = players[col_str(players, "current_club") == club].merge(
+            ratings, on="tm_id", how="left", suffixes=('', '_rating')
+        )
+        roster = roster.dropna(subset=['overall_now']) # Only show rated players
 
-# ===== ROLES =====
+        if roster.empty:
+            st.warning(f"No rated players found for {club}.")
+        else:
+            c1, c2 = st.columns([2,1])
+            with c1:
+                st.markdown(f"#### Squad Overview: {club}")
+                st.dataframe(roster[["player_name", "position_group", "age", "overall_now", "potential", "minutes_90"]].sort_values("overall_now", ascending=False),
+                             use_container_width=True, hide_index=True)
+            with c2:
+                st.markdown("#### Squad Rating Distribution")
+                if PLOTLY_OK and not roster["overall_now"].dropna().empty:
+                    fig = go.Figure()
+                    fig.add_trace(go.Box(y=roster["overall_now"], name="Current Ability", marker_color='var(--accent)'))
+                    fig.add_trace(go.Box(y=roster["potential"], name="Potential", marker_color='var(--good)'))
+                    fig.update_layout(height=400, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="var(--card)", yaxis_title="Rating", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            st.divider()
+            st.markdown("#### Compare a Target Player")
+            target_name_club = st.text_input("Player name to compare", key="club_compare_name")
+            if target_name_club:
+                r_target = ratings[eq_name(ratings, "player_name", target_name_club)].tail(1)
+                if r_target.empty:
+                    st.warning("No rating for that player.")
+                else:
+                    t_now = float(r_target.iloc[0]["overall_now"])
+                    t_pg = r_target.iloc[0]["position_group"]
+                    band = roster[roster['position_group']==t_pg]["overall_now"].dropna()
+                    
+                    st.write(f"**{target_name_club} (Overall: {t_now:.1f}, Position: {t_pg})**")
+                    if not band.empty:
+                        q1, med, q3 = band.quantile(0.25), band.median(), band.quantile(0.75)
+                        msg = "a clear upgrade" if t_now > q3 else "a good fit" if t_now >= med else "a potential rotation option" if t_now >= q1 else "below the current standard"
+                        st.success(f"Compared to {club}'s {t_pg}s, this player is **{msg}**.")
+                        st.caption(f"Positional band at {club}: Lower Quartile {q1:.1f}, Median {med:.1f}, Upper Quartile {q3:.1f}")
+                    else:
+                        st.info(f"The club has no rated players in the '{t_pg}' position group to compare against.")
+
+# ===== Roles =====
 with tab_roles:
-    st.subheader("Roles & Archetypes")
-    if not SKLEARN_OK:
-        st.info("`scikit-learn` not available. Install from requirements to enable clustering.")
-    if st.button("Rebuild role clusters"):
-        rebuild_roles(ss)
-        roles = read_sheet(ss, "roles")
-        st.success("Roles rebuilt.")
+    st.subheader("Positional Roles & Archetypes")
+    if st.button("Rebuild role clusters", key="roles_rebuild"):
+        with st.spinner("Clustering players... this may take a moment."):
+            rebuild_roles(ss)
+            st.cache_data.clear()
+            st.experimental_rerun()
+    
     if roles.empty:
-        st.info("No roles yet.")
+        st.info("No role data found. Click 'Rebuild' to generate archetypes from the feature store.")
     else:
-        pg = st.selectbox("Position group", ["FW","MF","DF","GK"])
-        rview = roles[roles["position_group"]==pg]
+        pg = st.selectbox("Position group", ["FW","MF","DF","GK"], key="roles_pg")
+        rview = roles[col_str(roles,"position_group")==pg]
+        
         if rview.empty:
-            st.info("No players for this group.")
+            st.info(f"No players found for position group '{pg}' to build roles.")
         else:
             if PLOTLY_OK:
                 fig = go.Figure()
                 for lab, grp in rview.groupby("role_label"):
-                    fig.add_trace(go.Scatter(x=grp["pca_x"], y=grp["pca_y"], mode="markers", name=lab, text=grp["player_name"]))
-                fig.update_layout(height=480, paper_bgcolor="rgba(0,0,0,0)")
+                    fig.add_trace(go.Scatter(x=grp["pca_x"], y=grp["pca_y"], mode="markers", name=lab, text=grp["player_name"],
+                                             marker=dict(size=8, opacity=0.8)))
+                fig.update_layout(height=500, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="var(--card)", legend_title_text='Identified Roles')
                 st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(rview[["player_name","role_label","role_cluster"]]
-                         .sort_values(["role_label","player_name"]), use_container_width=True, hide_index=True)
+            st.dataframe(rview[["player_name","role_label"]].sort_values(["role_label","player_name"]),
+                         use_container_width=True, hide_index=True)
 
-# ===== ADMIN / DATA =====
+
+# ===== Admin =====
 with tab_admin:
-    st.subheader("Admin — Players & Stats")
+    st.subheader("Admin — Data Management & Model Building")
     col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("### Add / update a player")
-        pname = st.text_input("Player name *", key="adm_name")
-        tm_in = st.text_input("Transfermarkt URL/ID *", key="adm_tm")
-        pos_txt = st.text_input("Positions (e.g., LW/ST or CB)", key="adm_pos")
-        club = st.text_input("Current club (optional)", key="adm_club")
-        dob = st.text_input("DOB (YYYY-MM-DD) (optional)", key="adm_dob")
-        if st.button("Upsert player", key="adm_up"):
-            tm = parse_tm_id(tm_in)
-            if not pname or not tm:
-                st.error("Need player name + valid Transfermarkt URL/ID.")
-            else:
-                rec = pd.DataFrame([{
-                    "player_name":pname, "tm_url":tm_in, "tm_id":tm,
-                    "positions":pos_txt, "position_group": position_group_from_text(pos_txt),
-                    "current_club": club, "dob": dob
-                }])
-                ins, upd = upsert_players(ss, rec)
-                st.success(f"Inserted {ins}, Updated {upd}. See `players` sheet.")
+        with st.expander("➕ Add / Update a Player", expanded=False):
+            with st.form("add_player_form"):
+                pname = st.text_input("Player name *")
+                tm_in = st.text_input("Transfermarkt URL/ID *")
+                pos_txt = st.text_input("Positions (e.g., LW/ST or CB)")
+                club = st.text_input("Current club")
+                dob = st.text_input("DOB (YYYY-MM-DD)")
+                contract = st.text_input("Contract Until (YYYY-MM-DD)")
+                submitted = st.form_submit_button("Upsert Player")
+                if submitted:
+                    tm = parse_tm_id(tm_in)
+                    if not pname or not tm:
+                        st.error("Player name and a valid Transfermarkt URL/ID are required.")
+                    else:
+                        rec = pd.DataFrame([{"player_name":pname, "tm_url":tm_in, "tm_id":tm, "positions":pos_txt,
+                                             "position_group": position_group_from_text(pos_txt), "current_club": club,
+                                             "dob": dob, "contract_until": contract}])
+                        with st.spinner("Updating players database..."):
+                            ins, upd = upsert_players(ss, rec)
+                        st.success(f"Player DB updated: Inserted {ins}, Updated {upd}.")
 
-        st.divider()
-        st.markdown("### Upload player match stats (Excel/CSV) → `raw_matches`")
-        upload = st.file_uploader("Upload .xlsx or .csv", type=["xlsx","csv"], key="adm_file")
-        tm_rows = st.text_input("Transfermarkt URL/ID for these rows (optional)", key="adm_tm_rows")
-        tm_rows_id = parse_tm_id(tm_rows) if tm_rows else None
-        if upload is not None:
-            df_in = None
-            try:
-                df_in = pd.read_excel(upload, sheet_name=0) if upload.name.lower().endswith(".xlsx") else pd.read_csv(upload)
-            except Exception:
-                upload.seek(0)
-                try: df_in = pd.read_csv(upload, encoding="utf-8", engine="python")
-                except Exception: st.error("Could not read file.")
-            if df_in is not None and not df_in.empty:
-                st.dataframe(df_in.head(15), use_container_width=True, hide_index=True)
-                cols = {c.lower(): c for c in df_in.columns}
-                def find(*keys):
-                    for k in keys:
-                        for c in cols:
-                            if k in c:
-                                return cols[c]
-                    return ""
-                st.markdown("**Field mapping (edit if needed):**")
-                grid = [
-                    ("player_name",("player","name")), ("date",("date","match date")),
-                    ("competition",("competition","league")), ("opponent",("opponent","rival")),
-                    ("minutes",("minute","min")), ("shots",("shots",)),
-                    ("xg",("xg",)), ("xa",("xa",)), ("key_passes",("key passes","key_pass")),
-                    ("progressive_passes",("progressive passes","prog pass")),
-                    ("progressive_carries",("progressive carries","prog carr")),
-                    ("dribbles_won",("dribbles won","dribble")), ("tackles_won",("tackles won","tackle")),
-                    ("interceptions",("interceptions",)), ("aerials_won",("aerials won","aerial")),
-                    ("passes",("passes /","passes")), ("passes_accurate",("accurate","unnamed")),
-                    ("touches",("touches",)), ("duels_won",("duels won","duel")), ("position",("position","pos"))
-                ]
-                m = {}
-                cA, cB, cC = st.columns(3)
-                for i,(k,keys) in enumerate(grid):
-                    default = find(*keys)
-                    m[k] = (cA if i%3==0 else cB if i%3==1 else cC).text_input(k, value=default, key=f"map_{k}")
-                if st.button("Append to raw_matches", key="append_raw"):
-                    rows = []
-                    for _, r in df_in.iterrows():
-                        row = {h:"" for h in RAW_MATCHES_HEADERS}
-                        for k in m:
-                            src = st.session_state.get(f"map_{k}", "")
-                            if src and src in df_in.columns:
-                                row[k] = r[src]
-                        if tm_rows_id: row["tm_id"] = tm_rows_id
-                        if row.get("date",""):
-                            try: row["date"] = dtparser.parse(str(row["date"])).date().isoformat()
-                            except Exception: pass
-                        rows.append(row)
-                    added = append_raw_matches(ss, pd.DataFrame(rows))
-                    st.success(f"Appended {added} rows to `raw_matches`.")
+        with st.expander("📈 Upload Match Stats (Excel/CSV)", expanded=True):
+            upload = st.file_uploader("Upload .xlsx or .csv", type=["xlsx","csv"], key="adm_file")
+            tm_rows = st.text_input("Transfermarkt ID for all rows in this file (optional)", key="adm_tm_rows")
+            if upload is not None:
+                try:
+                    df_in = pd.read_excel(upload) if upload.name.lower().endswith(".xlsx") else pd.read_csv(upload)
+                    st.dataframe(df_in.head(10), use_container_width=True, hide_index=True)
+                    if st.button("Append to raw_matches", key="append_raw"):
+                        tm_rows_id = parse_tm_id(tm_rows) if tm_rows else None
+                        with st.spinner("Appending data..."):
+                            added = append_raw_matches(ss, df_in, tm_id_for_rows=tm_rows_id)
+                        st.success(f"Appended {added} rows to `raw_matches` sheet.")
+                except Exception as e:
+                    st.error(f"Could not read file. Error: {e}")
 
     with col2:
-        st.markdown("### Build Feature Store & Ratings")
-        if st.button("Rebuild feature_store"):
-            rebuild_feature_store(ss)
-            st.success("Feature store rebuilt.")
-        if st.button("Rebuild ratings", type="primary"):
-            rebuild_ratings(ss, settings)
+        st.markdown("### Build Pipeline")
+        st.info("Build the feature store first, then build the ratings.")
+        if st.button("Rebuild Feature Store"):
+            build_feature_store(ss)
+            st.success("Feature store rebuilt successfully.")
+        
+        if st.button("Rebuild Ratings (Primary Model)", type="primary"):
+            new_ratings = rebuild_ratings(ss, settings)
             settings["last_build"] = now_ts()
             save_settings(ss, settings)
-            st.success("Ratings rebuilt. See `ratings` tab.")
+            st.success(f"Ratings rebuilt for {len(new_ratings)} players. See Dashboard.")
+        
         st.divider()
-        st.markdown("### Upload club roster CSV → `club_rosters`")
-        st.caption("Required columns: tm_id, player_name, club_name, position_group, minutes")
-        roster = st.file_uploader("Upload roster CSV", type=["csv"], key="adm_roster")
-        if roster is not None:
-            try:
-                df_r = pd.read_csv(roster)
-                need = {"tm_id","player_name","club_name","position_group","minutes"}
-                if not need.issubset(set(df_r.columns)):
-                    st.error(f"Missing columns: {need - set(df_r.columns)}")
-                else:
-                    write_sheet(ss, "club_rosters", df_r[["tm_id","player_name","club_name","position_group","minutes"]])
-                    st.success("club_rosters updated.")
-            except Exception as e:
-                st.error(f"Failed to read roster: {e}")
+        st.markdown("### Danger Zone")
+        st.warning("These operations will overwrite existing data.")
+        # Simplified V2 Club tab removes the need for this upload.
+        st.caption("The 'Club Rosters' tab has been deprecated in V2. Club data is now generated automatically from the 'players' sheet.")
 
-# ===== SETTINGS =====
+
+# ===== Settings =====
 with tab_settings:
-    st.subheader("Weights & Toggles")
-    w1, w2 = st.columns(2)
-    with w1:
-        st.markdown("**Block weights**")
-        settings["w_attack"] = st.slider("Attack", 0.0, 1.0, float(settings["w_attack"]), 0.01)
-        settings["w_progression"] = st.slider("Progression", 0.0, 1.0, float(settings["w_progression"]), 0.01)
-        settings["w_defence"] = st.slider("Defence", 0.0, 1.0, float(settings["w_defence"]), 0.01)
-        settings["w_passing"] = st.slider("Passing", 0.0, 1.0, float(settings["w_passing"]), 0.01)
-    with w2:
-        st.markdown("**Age curve & projection**")
-        settings["age_curve_u21"] = st.slider("Age ≤21", 0.8, 1.3, float(settings["age_curve_u21"]), 0.01)
-        settings["age_curve_22_24"] = st.slider("22–24", 0.8, 1.3, float(settings["age_curve_22_24"]), 0.01)
-        settings["age_curve_25_28"] = st.slider("25–28", 0.8, 1.3, float(settings["age_curve_25_28"]), 0.01)
-        settings["age_curve_29_31"] = st.slider("29–31", 0.7, 1.2, float(settings["age_curve_29_31"]), 0.01)
-        settings["age_curve_32_34"] = st.slider("32–34", 0.7, 1.2, float(settings["age_curve_32_34"]), 0.01)
-        settings["age_curve_35p"] = st.slider("35+", 0.6, 1.1, float(settings["age_curve_35p"]), 0.01)
-        settings["projection_u22"] = st.slider("Projection ≤22", 0.9, 1.3, float(settings["projection_u22"]), 0.01)
-        settings["projection_23_26"] = st.slider("Projection 23–26", 0.9, 1.2, float(settings["projection_23_26"]), 0.01)
-        settings["projection_30p"] = st.slider("Projection ≥30", 0.8, 1.1, float(settings["projection_30p"]), 0.01)
-        settings["minutes_shrink_lt900"] = st.slider("Shrink <900 mins", 0.5, 1.0, float(settings["minutes_shrink_lt900"]), 0.01)
-        settings["minutes_shrink_900_1799"] = st.slider("Shrink 900–1799", 0.6, 1.0, float(settings["minutes_shrink_900_1799"]), 0.01)
-        settings["tm_value_fetch"] = st.toggle("Best-effort TM value fetch", value=bool(settings.get("tm_value_fetch", True)))
-    if st.button("Save settings", type="primary"):
-        save_settings(ss, settings)
-        st.success("Saved. Rebuild ratings to apply changes.")
+    st.subheader("Model Configuration")
+    st.info("After changing settings, you must go to the Admin tab and click 'Rebuild Ratings' for them to take effect.")
+    
+    with st.form("settings_form"):
+        s = settings.copy() # Work on a copy
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Core Weights**")
+            s["w_attack"] = st.slider("Attack Weight", 0.0, 1.0, float(s.get("w_attack",0.35)), 0.01)
+            s["w_progression"] = st.slider("Progression Weight", 0.0, 1.0, float(s.get("w_progression",0.25)), 0.01)
+            s["w_defence"] = st.slider("Defence Weight", 0.0, 1.0, float(s.get("w_defence",0.20)), 0.01)
+            s["w_passing"] = st.slider("Passing Weight", 0.0, 1.0, float(s.get("w_passing",0.20)), 0.01)
+        
+        with c2:
+            st.markdown("**Age & Potential**")
+            s["age_peak_start"] = st.slider("Peak Age Start", 22, 30, int(s.get("age_peak_start", 25)))
+            s["age_peak_end"] = st.slider("Peak Age End", 25, 33, int(s.get("age_peak_end", 28)))
+            
+            st.markdown("**Data Confidence**")
+            s["minutes_confidence_floor"] = st.slider("Uncertainty Floor (min minutes)", 100, 1000, int(s.get("minutes_confidence_floor", 450)), 50)
+            s["minutes_confidence_ceiling"] = st.slider("Uncertainty Ceiling (max minutes)", 1500, 3500, int(s.get("minutes_confidence_ceiling", 2200)), 100)
 
-st.caption("DJM © — Automated, explainable scouting. Upload stats → roles → ratings → deals.")
+        st.markdown("**League Strength Factors**")
+        lf_json = s.get("league_factors", json.dumps(DEFAULT_LEAGUE_FACTORS))
+        s["league_factors"] = st.text_area("Competition factors (JSON format)", value=lf_json, height=150)
+        
+        submitted = st.form_submit_button("Save Settings")
+        if submitted:
+            try:
+                # Validate JSON
+                json.loads(s["league_factors"])
+                save_settings(ss, s)
+                st.success("Settings saved successfully!")
+                st.cache_data.clear() # Clear cache to reload settings on next run
+            except json.JSONDecodeError:
+                st.error("Invalid JSON format in League Strength Factors.")
+            except Exception as e:
+                st.error(f"Failed to save settings: {e}")
