@@ -8,4 +8,5 @@ plotly>=5.22
 openpyxl>=3.1.2
 python-dateutil>=2.9
 rapidfuzz>=3.9.7
+scikit-learn>=1.4
 requests>=2.32
