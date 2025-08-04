@@ -1,11 +1,8 @@
-# DJM — Scouting & Transfer Intelligence (Monolith V2 — enhanced)
+# DJM — Scouting & Transfer Intelligence (Monolith V2.1 — stable)
 # ----------------------------------------------------------------------
-# V2 Design Goals (building on V1):
-# - Enhanced Modelling: Introduce league strength modifiers and positional normalization.
-# - Credible Uncertainty: Replace static uncertainty with a minutes-played-driven model.
-# - Richer Player Insights: Add radar charts for visual profiling and a "Similar Players" feature.
-# - Improved UX: Automate club roster generation and refine UI components.
-# - Code Quality & Maintainability: Add type hinting and centralize configuration.
+# V2.1 Changes:
+# - Fixed NameError by moving optional-dependency functions (plot_radar_chart)
+#   inside the try/except block where the dependency is imported.
 
 import streamlit as st
 import pandas as pd
@@ -33,8 +30,38 @@ except Exception:
 try:
     import plotly.graph_objects as go
     PLOTLY_OK = True
+    # V2.1 FIX: Define the function that USES plotly inside the try block.
+    def plot_radar_chart(stats: Dict[str, float], title: str) -> "go.Figure":
+        categories = list(stats.keys())
+        values = list(stats.values())
+        fig = go.Figure()
+        fig.add_trace(go.Scatterpolar(
+            r=values,
+            theta=categories,
+            fill='toself',
+            line_color='var(--accent)',
+            marker=dict(color='var(--accent)'),
+            name='Score'
+        ))
+        fig.update_layout(
+            polar=dict(
+                radialaxis=dict(visible=True, range=[0, 100], color='var(--muted)', gridcolor='rgba(255,255,255,0.1)'),
+                angularaxis=dict(color='var(--muted)', linecolor='rgba(255,255,255,0.1)')
+            ),
+            showlegend=False,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            height=300,
+            margin=dict(l=40, r=40, t=60, b=40),
+            title=dict(text=title, font=dict(color='#E9F1FF'))
+        )
+        return fig
+
 except Exception:
     PLOTLY_OK = False
+    # If plotly fails, create a dummy function so the app doesn't crash if it's called.
+    def plot_radar_chart(stats: Dict[str, float], title: str):
+        return None
 
 # Clustering & Similarity
 try:
@@ -104,6 +131,7 @@ DEFAULT_SETTINGS = {
 
 # -------- Utilities --------
 def now_ts() -> str:
+    # Set for Lucca, Italy
     tz = pytz.timezone("Europe/Rome")
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
 
@@ -205,33 +233,6 @@ def best_effort_tm_value(tm_url: str, enabled: bool = True) -> Optional[str]:
         m = re.search(r"Market value[^€£]*([€£]\s?[\d\.,]+[mk]?)", r.text, re.I)
         return m.group(1).replace(" ","") if m else None
     except Exception: return None
-
-# -------- V2: UI Components --------
-def plot_radar_chart(stats: Dict[str, float], title: str) -> go.Figure:
-    categories = list(stats.keys())
-    values = list(stats.values())
-    fig = go.Figure()
-    fig.add_trace(go.Scatterpolar(
-        r=values,
-        theta=categories,
-        fill='toself',
-        line_color='var(--accent)',
-        marker=dict(color='var(--accent)'),
-        name='Score'
-    ))
-    fig.update_layout(
-        polar=dict(
-            radialaxis=dict(visible=True, range=[0, 100], color='var(--muted)', gridcolor='rgba(255,255,255,0.1)'),
-            angularaxis=dict(color='var(--muted)', linecolor='rgba(255,255,255,0.1)')
-        ),
-        showlegend=False,
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        height=300,
-        margin=dict(l=40, r=40, t=60, b=40),
-        title=dict(text=title, font=dict(color='#E9F1FF'))
-    )
-    return fig
 
 # -------- Admin upserts & ingestion --------
 def upsert_players(ss: gspread.Spreadsheet, df_in: pd.DataFrame) -> Tuple[int, int]:
@@ -379,11 +380,11 @@ def rebuild_ratings(_ss: gspread.Spreadsheet, settings: Dict) -> pd.DataFrame:
     
     if not raw.empty and 'competition' in raw.columns:
         # Calculate avg league factor per player
-        raw['league_factor'] = raw['competition'].map(lambda x: league_factors.get(x, league_factors["Default"]))
+        raw['league_factor'] = raw['competition'].map(lambda x: league_factors.get(x, league_factors.get("Default", 0.7)))
         league_adj_map = raw.groupby('tm_id')['league_factor'].mean()
-        df['league_adj'] = df['tm_id'].map(league_adj_map).fillna(league_factors["Default"])
+        df['league_adj'] = df['tm_id'].map(league_adj_map).fillna(league_factors.get("Default", 0.7))
     else:
-        df['league_adj'] = league_factors["Default"]
+        df['league_adj'] = league_factors.get("Default", 0.7)
         
     # V2: Positional Normalization
     # Normalize performance metrics *within* each position group
@@ -532,7 +533,7 @@ players, raw, feats, ratings, roles, settings = data.values()
 # ---------------- Header -------------------------
 st.markdown(
     "<div class='djm-card'><div style='font-size:28px;font-weight:800;'>DJM — Scouting & Transfer Intelligence</div>"
-    "<div style='color:#9aa4b2'>V2: Positional Normalization · League Adjustments · Similarity Search · Dynamic Insights</div></div>",
+    "<div style='color:#9aa4b2'>V2.1: Positional Normalization · League Adjustments · Similarity Search · Dynamic Insights</div></div>",
     unsafe_allow_html=True
 )
 st.write("")
@@ -626,11 +627,18 @@ with tab_player:
             with col_radar:
                 if not p_feat.empty and PLOTLY_OK:
                     f = p_feat.iloc[0]
-                    # Get the raw un-normalized scores for the radar
-                    att_score  = norm_by_group(0.6*f["xg_p90"] + 0.4*f["xa_p90"] + 0.2*f["shots_p90"] + 0.4*f["kp_p90"]) * 100
-                    prog_score = norm_by_group(0.6*f["prog_pass_p90"] + 0.4*f["prog_carry_p90"] + 0.2*f["dribbles_p90"]) * 100
-                    dfn_score  = norm_by_group(0.6*f["tackles_p90"] + 0.6*f["inter_p90"] + 0.2*f["aerials_p90"]) * 100
-                    pas_score  = norm_by_group(f["pass_acc"]) * 100
+                    # Create a temporary series for normalization to work correctly
+                    temp_series = pd.Series([f["xg_p90"], f["xa_p90"], f["shots_p90"], f["kp_p90"]])
+                    att_score  = norm_by_group(temp_series).iloc[0] * 100
+
+                    temp_series = pd.Series([f["prog_pass_p90"], f["prog_carry_p90"], f["dribbles_p90"]])
+                    prog_score = norm_by_group(temp_series).iloc[0] * 100
+
+                    temp_series = pd.Series([f["tackles_p90"], f["inter_p90"], f["aerials_p90"]])
+                    dfn_score  = norm_by_group(temp_series).iloc[0] * 100
+                    
+                    pas_score  = norm_by_group(pd.Series([f["pass_acc"]]))[0] * 100
+                    
                     radar_stats = {
                         "Attacking": att_score, "Progression": prog_score,
                         "Defending": dfn_score, "Passing": pas_score
@@ -656,8 +664,9 @@ with tab_club:
         st.info("Requires `players` and `ratings` data. Please add players and build ratings in the Admin panel.")
     else:
         # V2: Dynamic roster generation from players table
-        all_clubs = sorted(col_str(players,"current_club").unique())
-        club = st.selectbox("Select a Club", all_clubs, index=all_clubs.index('Manchester City') if 'Manchester City' in all_clubs else 0)
+        all_clubs = sorted([c for c in col_str(players,"current_club").unique() if c])
+        club_default_index = all_clubs.index('Manchester City') if 'Manchester City' in all_clubs else 0
+        club = st.selectbox("Select a Club", all_clubs, index=club_default_index)
         
         # Merge players at the selected club with their ratings
         roster = players[col_str(players, "current_club") == club].merge(
@@ -790,8 +799,7 @@ with tab_admin:
         st.divider()
         st.markdown("### Danger Zone")
         st.warning("These operations will overwrite existing data.")
-        # Simplified V2 Club tab removes the need for this upload.
-        st.caption("The 'Club Rosters' tab has been deprecated in V2. Club data is now generated automatically from the 'players' sheet.")
+        st.caption("The 'Club Rosters' tab has been deprecated. Club data is now generated automatically from the 'players' sheet.")
 
 
 # ===== Settings =====
