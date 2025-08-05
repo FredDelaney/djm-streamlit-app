@@ -694,30 +694,69 @@ with tab_dash:
         )
     show_kpi(kpi_cols[0], "Players in DB", len(players) if not players.empty else 0)
     show_kpi(kpi_cols[1], "Match Logs", f"{len(raw):,}" if not raw.empty else 0)
-    show_kpi(kpi_cols[2], "Rated Players", len(ratings["tm_id"].unique()) if not ratings.empty else 0)
+    try:
+        rated_unique = len(ratings["tm_id"].astype(str).unique()) if not ratings.empty and "tm_id" in ratings.columns else 0
+    except Exception:
+        rated_unique = 0
+    show_kpi(kpi_cols[2], "Rated Players", rated_unique)
     show_kpi(kpi_cols[3], "Last Model Build", settings.get("last_build", "—"))
+
     st.subheader("Leaderboard")
     if ratings.empty:
         st.info("No ratings data available. Use the **Admin** tab to build the feature store and ratings model.")
     else:
-        # Filter and sort controls
+        # Ensure expected columns exist, create if missing to avoid KeyErrors
+        required_cols = ["player_name", "position_group", "age", "overall_now", "potential",
+                         "uncert_now", "minutes_90", "league_adj", "tm_id"]
+        for c in required_cols:
+            if c not in ratings.columns:
+                ratings[c] = np.nan
+
         pos_filter = st.selectbox("Position Filter", ["All", "GK", "DF", "MF", "FW"], index=0)
-        sort_by = st.selectbox("Sort by", ["Overall Now", "Potential"], index=0, horizontal=True)
-        sort_col = "overall_now" if sort_by == "Overall Now" else "potential"
+
+        # Use a dropdown (no horizontal kw)
+        sort_by = st.selectbox("Sort by", ["Overall Now", "Potential"], index=0)
+
+        # If 'potential' is missing or entirely NaN, fall back to 'overall_now'
+        potential_missing = ("potential" not in ratings.columns) or ratings["potential"].isna().all()
+        sort_col = "potential" if (sort_by == "Potential" and not potential_missing) else "overall_now"
+        if sort_by == "Potential" and potential_missing:
+            st.caption("⚠️ No 'potential' values found — sorting by Overall instead. Rebuild the ratings in **Admin** to populate Potential.")
+
         # Apply position filter
-        if pos_filter != "All":
-            filtered = ratings[ratings["position_group"] == pos_filter].copy()
-        else:
-            filtered = ratings.copy()
-        # Prepare display DataFrame
-        display = filtered.copy()
-        display["overall_now"] = display["overall_now"].map("{:,.1f}".format)
-        display["potential"] = display["potential"].map("{:,.1f}".format)
-        df_top = display.sort_values(sort_col, ascending=False).head(25)[
-            ["player_name", "position_group", "age", "overall_now", "potential", "uncert_now", "minutes_90", "league_adj"]
-        ].copy()
-        df_top.columns = ["Name", "Pos", "Age", "Overall", "Potential", "Uncert.", "90s", "Lg Adj"]
+        filtered = ratings[ratings["position_group"] == pos_filter].copy() if pos_filter != "All" else ratings.copy()
+
+        # Ensure numeric types for sortable/format columns
+        numeric_cols = ["overall_now", "potential", "uncert_now", "minutes_90", "league_adj"]
+        for c in numeric_cols:
+            if c in filtered.columns:
+                filtered[c] = pd.to_numeric(filtered[c], errors="coerce")
+
+        # Sort + select
+        existing_cols = [c for c in ["player_name", "position_group", "age", "overall_now",
+                                     "potential", "uncert_now", "minutes_90", "league_adj"] if c in filtered.columns]
+        if sort_col not in filtered.columns:
+            sort_col = "overall_now"
+        df_top = filtered.sort_values(by=sort_col, ascending=False, na_position="last").head(25)[existing_cols].copy()
+
+        # Format numeric columns safely
+        def fmt1(v):
+            return f"{float(v):,.1f}" if pd.notna(v) else ""
+
+        for c in ["overall_now", "potential", "uncert_now", "minutes_90", "league_adj"]:
+            if c in df_top.columns:
+                df_top[c] = df_top[c].map(fmt1)
+
+        # Rename for display
+        rename_map = {
+            "player_name": "Name", "position_group": "Pos", "age": "Age",
+            "overall_now": "Overall", "potential": "Potential",
+            "uncert_now": "Uncert.", "minutes_90": "90s", "league_adj": "Lg Adj"
+        }
+        df_top = df_top.rename(columns={k: v for k, v in rename_map.items() if k in df_top.columns})
+
         st.dataframe(df_top, use_container_width=True, hide_index=True)
+
 
 # ===== Player Profile Tab =====
 with tab_player:
