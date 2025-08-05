@@ -4,6 +4,9 @@
 # - Added notifications for missing dependencies (Plotly, scikit-learn).
 # - Improved fuzzy search and filtering for player and club analysis.
 # - Enhanced UI styling: consistent dark theme for charts, better labels, card layouts.
+# Hotfix (2025-08-05):
+# - Robust Google Sheets connector (sheet_url → sheet_id → sheet_name).
+# - Fixed load_all_data argument (use ss instead of st.secrets).
 
 import streamlit as st
 import pandas as pd
@@ -114,7 +117,10 @@ h3 { margin-top: 1.5rem; }
 st.markdown(f"<style>{THEME_CSS}</style>", unsafe_allow_html=True)
 
 # -------- Settings & Data Constants --------
-SHEET_NAME = st.secrets.get("sheet_name", "DJM_Input")  # Name of Google Sheet (tabbed workbook)
+# Prefer URL -> ID -> Name: support any of these in secrets.toml
+SHEET_URL  = st.secrets.get("sheet_url", "")
+SHEET_ID   = st.secrets.get("sheet_id", "")
+SHEET_NAME = st.secrets.get("sheet_name", "DJM_Input")  # fallback name
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.readonly"]
 
 # Dataframe column schemas
@@ -160,9 +166,13 @@ def now_ts() -> str:
 
 @st.cache_resource(show_spinner="Connecting to Google Sheets...")
 def connect_sheet() -> gspread.Spreadsheet:
-    """Authenticate and return a gspread Spreadsheet client."""
+    """Authenticate and return a gspread Spreadsheet client (url -> id -> name)."""
     creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
     client = gspread.authorize(creds)
+    if SHEET_URL:
+        return client.open_by_url(SHEET_URL)
+    if SHEET_ID:
+        return client.open_by_key(SHEET_ID)
     return client.open(SHEET_NAME)
 
 def get_or_create_ws(ss: gspread.Spreadsheet, name: str, headers: Optional[List[str]] = None) -> gspread.Worksheet:
@@ -503,25 +513,20 @@ def rebuild_ratings(_ss: gspread.Spreadsheet, settings: Dict[str, Any]) -> pd.Da
     else:
         df["league_adj"] = league_factors.get("Default", 0.7)
     # Positional normalization: scale stats relative to others in same position group
-    base_scores = []
     for pg, group in df.groupby("position_group"):
         if group.empty:
             continue
-        # Weighted contributions for four skill areas
         attack = norm_by_group(0.6*group["xg_p90"] + 0.4*group["xa_p90"] + 0.2*group["shots_p90"] + 0.4*group["kp_p90"])
         progress = norm_by_group(0.6*group["prog_pass_p90"] + 0.4*group["prog_carry_p90"] + 0.2*group["dribbles_p90"])
         defence = norm_by_group(0.6*group["tackles_p90"] + 0.6*group["inter_p90"] + 0.2*group["aerials_p90"])
         passing = norm_by_group(group["pass_acc"])
         group_base = (settings["w_attack"] * attack + settings["w_progression"] * progress +
                       settings["w_defence"] * defence + settings["w_passing"] * passing).clip(0, 1)
-        # Assign back to main DataFrame (by position group index)
         df.loc[group.index, "base_score"] = group_base.fillna(0)
     # Calculate overall ratings
     players_age = pd.to_numeric(df["age"], errors='coerce')
     age_factor = players_age.map(lambda a: age_curve_multiplier(a, settings))
-    # Current overall ability (0-100)
     overall_now = (df["base_score"] * age_factor * df["league_adj"]).clip(0, 1) * 100
-    # Potential (0-100) cannot be lower than current, more for younger players
     potential = (overall_now * (1 + (settings["age_peak_start"] - players_age).clip(lower=0) / 100 * (1 - overall_now/100))
                 ).clip(lower=overall_now, upper=100)
     ratings_df = pd.DataFrame({
@@ -590,7 +595,6 @@ def rebuild_roles(ss: gspread.Spreadsheet, n_clusters: int = 4):
         return
     df = feats.merge(players_df[["tm_id", "position_group"]], on="tm_id", how="left")
     role_results = []
-    # Define human-readable role labels (will cycle through if clusters > labels provided)
     ROLE_LABELS = {
         "GK": ["Sweeper Keeper", "Shot-Stopper"],
         "DF": ["Ball-Playing Defender", "No-Nonsense CB", "Inverted Full-Back", "Wing-Back", "Overlapping Full-Back"],
@@ -601,19 +605,14 @@ def rebuild_roles(ss: gspread.Spreadsheet, n_clusters: int = 4):
         sub = df[df["position_group"] == pg].copy()
         if sub.empty:
             continue
-        # Determine number of clusters (at most n_clusters, but not more than players count/8 to avoid too many tiny clusters)
         k = min(n_clusters, max(1, len(sub) // 8))
         if k < 1:
             continue
-        # Prepare data for clustering
         X = sub[ROLE_FEATURES].fillna(0.0).values
         X_scaled = StandardScaler().fit_transform(X)
-        # Run KMeans clustering
         km = KMeans(n_clusters=k, n_init="auto", random_state=42)
         labels = km.fit_predict(X_scaled)
-        # 2D PCA for visualization
         pca_coords = PCA(n_components=2, random_state=42).fit_transform(X_scaled)
-        # Assign human-friendly labels (cycle through predefined list if needed)
         label_names = ROLE_LABELS.get(pg, [f"{pg} Role {i}" for i in range(k)])
         human_labels = [label_names[label % len(label_names)] for label in labels]
         result_df = pd.DataFrame({
@@ -636,7 +635,8 @@ with st.sidebar:
     st.header("Data Source")
     try:
         ss = connect_sheet()
-        st.success(f"✅ Connected to **{SHEET_NAME}**")
+        # Show actual connected sheet title
+        st.success(f"✅ Connected to **{getattr(ss, 'title', SHEET_NAME)}**")
     except Exception as e:
         st.error(f"❌ GSheets connection failed. Check secrets & sharing. Details: {e}", icon="⚠️")
         st.stop()
@@ -647,7 +647,7 @@ with st.sidebar:
 
 # Cache all data reads for quick access
 @st.cache_data(show_spinner="Loading database sheets...")
-def load_all_data(_ss: gspread.Spreadsheet) -> Dict[str, pd.DataFrame]:
+def load_all_data(_ss: gspread.Spreadsheet) -> Dict[str, Any]:
     return {
         "players": read_tab(_ss, "players"),
         "raw": read_tab(_ss, "raw_matches"),
@@ -657,7 +657,9 @@ def load_all_data(_ss: gspread.Spreadsheet) -> Dict[str, pd.DataFrame]:
         "settings": load_settings(_ss)
     }
 
+# 🔧 FIX: pass the Spreadsheet object, not st.secrets
 data = load_all_data(ss)
+
 players = data["players"]
 raw = data["raw"]
 feats = data["feats"]
@@ -676,7 +678,7 @@ st.markdown(
 st.write("")  # spacer
 
 # ---------------- Main Tabs --------------------------
-tab_dash, tab_player, tab_club, tab_roles, tab_admin, tab_settings = st.tabs(
+tab_dash, tab_player, tab_club, tab_roles, tab_admin, tab_settings_tab = st.tabs(
     ["Dashboard", "👤 Player Profile", "🏟️ Club Analysis", "🧩 Roles & Similarity", "⚙️ Admin", "🔧 Settings"]
 )
 
@@ -1009,7 +1011,7 @@ with tab_admin:
         st.caption("*(Note: The old 'Club Rosters' tab is deprecated; club data is now derived from the Players sheet.)*")
 
 # ===== Settings Tab =====
-with tab_settings:
+with tab_settings_tab:
     st.subheader("Model Configuration")
     st.info("Adjust parameters below and click **Save Settings**, then rebuild the ratings in the Admin tab for changes to take effect.")
     with st.form("settings_form"):
